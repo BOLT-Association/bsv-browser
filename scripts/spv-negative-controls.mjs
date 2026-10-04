@@ -301,6 +301,27 @@ const controls = [
     to: 'if (false) {',
     tests: '__tests__/spv/live/zeroconf',
     env: { SPV_LIVE: '1' }
+  },
+  {
+    rule: 'monitor headers: a header must satisfy the chain rules',
+    file: `${T}/spv/monitorHeaders.ts`,
+    from: '    rules.validate({ height: header.height, hash: header.hash, bits: header.bits, time: header.time })\n',
+    to: '',
+    tests: '__tests__/spv/monitorHeaders'
+  },
+  {
+    rule: "monitor headers: a header's hash must be the hash of its fields",
+    file: `${T}/spv/monitorHeaders.ts`,
+    from: '    validateHeaderFormat(header as never)\n',
+    to: '',
+    tests: '__tests__/spv/monitorHeaders'
+  },
+  {
+    rule: 'monitor headers: the NewHeader task reads the tip under the chain rules',
+    file: `${T}/spv/monitorHeaders.ts`,
+    from: '  if (newHeader) {',
+    to: '  if (false) {',
+    tests: '__tests__/spv/monitorHeaders'
   }
 ]
 

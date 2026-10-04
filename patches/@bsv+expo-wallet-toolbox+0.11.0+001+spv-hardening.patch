@@ -1,8 +1,8 @@
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-index 48fd575..57ebe0b 100644
+index 48fd575..a08c4a6 100644
 --- a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-@@ -163,7 +163,14 @@ const DEFAULT_SETTINGS: WalletSettings = {
+@@ -163,7 +163,15 @@ const DEFAULT_SETTINGS: WalletSettings = {
  }
  import type { AppChain } from '../config'
  import { DEFAULT_STORAGE_URL, DEFAULT_CHAIN, ADMIN_ORIGINATOR, toWalletChain } from '../config'
@@ -11,6 +11,7 @@ index 48fd575..57ebe0b 100644
 +import { applySpvServices } from '../spv/applySpvServices'
 +import { makeSpvEventSourceClass } from '../spv/spvEventSource'
 +import { guardZeroConfInternalize } from '../spv/zeroConf'
++import { applyChainRulesToMonitorHeaders } from '../spv/monitorHeaders'
 +import { arcadeMerklePathOverride } from '../spv/arcadeMerklePath'
 +import { resolveHeaderSetup } from '../spv/headerSetup'
 +import { makeRemoteChaintracks } from '../spv/remoteChaintracks'
@@ -18,7 +19,7 @@ index 48fd575..57ebe0b 100644
  import {
    DEFAULT_AUTO_APPROVE_THRESHOLD,
    AUTO_APPROVE_COOLDOWN_MS,
-@@ -220,7 +227,7 @@ import { logWithTimestamp } from '../logging'
+@@ -220,7 +228,7 @@ import { logWithTimestamp } from '../logging'
  import { recoverMnemonicWallet } from '../mnemonicWallet'
  import { vaultStore } from '../services/vault/vaultStore'
  import { guardVaultAccess } from '../services/vault/guard'
@@ -27,7 +28,7 @@ index 48fd575..57ebe0b 100644
  import { StorageExpoSQLite } from '../storage'
  import { makeBuildGeneration } from './buildGeneration'
  import * as SQLite from 'expo-sqlite'
-@@ -275,7 +282,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
+@@ -275,7 +283,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
  import { SWEEP_INTERVAL_MS, runSweep, shouldSweepNow, sweptTotal } from '../pay/sweeper'
  import { formatAmount } from '../amountFormatHelpers'
  import { useTranslation } from 'react-i18next'
@@ -35,7 +36,7 @@ index 48fd575..57ebe0b 100644
  import { expoHeaderFs } from '../headers/fs'
  import { HeaderStore } from '../headers/headerStore'
  import { OfflineFirstChaintracks } from '../headers/OfflineFirstChaintracks'
-@@ -1257,8 +1263,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1257,8 +1264,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
          // for root misses and the source for header sync. chaintracksUrlFor is
          // the single source of truth for these URLs — createServiceOptions
          // calls the same function, so there is exactly one table to edit.
@@ -57,7 +58,7 @@ index 48fd575..57ebe0b 100644
          offlineChaintracksRef.current = offlineChaintracks
  
          // Passing offlineChaintracks here does two things, and createServices
-@@ -1292,7 +1309,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1292,7 +1310,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
          services.postBeefServices.remove('TaalArcBeef')
          services.postBeefServices.remove('Bitails')
          services.postBeefServices.remove('WhatsOnChain')
@@ -66,7 +67,7 @@ index 48fd575..57ebe0b 100644
          if (chain === 'main' || chain === 'test') {
            const taalArcUrl = chain === 'main' ? 'https://arc.taal.com' : 'https://arc-test.taal.com'
            services.postBeefServices.add(createTaalBroadcastService(taalArcUrl, serviceOptions.taalApiKey))
-@@ -1355,7 +1372,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1355,7 +1373,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
            getMerklePathSvc.add({ name: 'Bitails', service: bitailsGetMerklePath })
          }
  
@@ -92,7 +93,7 @@ index 48fd575..57ebe0b 100644
          // Consumed only by the toolbox storage-boundary hook. The value is set
          // by trusted host code and compared with WalletClient's originator;
          // external action fields cannot manufacture this authorization bit.
-@@ -1874,7 +1909,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1874,7 +1910,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
            }
            const monitorOptions = createWalletMonitorOptions(walletChain, storageManager, services, offlineChaintracks)
            monitorOptions.callbackToken = callbackToken
@@ -105,7 +106,22 @@ index 48fd575..57ebe0b 100644
            monitorOptions.onTransactionStatusChanged = async (_txid: string, _newStatus: string) => {
              setTxStatusVersion(v => v + 1)
              // The database moved, so the backup log has something to catch up on.
-@@ -2316,11 +2355,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -2143,6 +2183,14 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+             }
+           }
+ 
++          // spv: the monitor's own header checks demand mainnet proof of work, which a chain with
++          // other rules (regtest) never meets, so TaskNewHeader would fail on every poll and proofs
++          // would never be sought. Validate under the rules of the wallet's verified chain instead.
++          if (spvMode) {
++            const spvRules = resolveHeaderSetup(walletChain, getSpvOptions(), 'spv')?.rules
++            if (spvRules) applyChainRulesToMonitorHeaders(monitor as never, spvRules)
++          }
++
+           const newHeaderTask = monitor._tasks.find((t: any) => t.name === 'NewHeader') as any
+           if (newHeaderTask) {
+             configureNewHeaderPolling(newHeaderTask, {
+@@ -2316,11 +2364,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
              // a store) that belongs to a different build.
              const stillCurrent = () => offlineChaintracksRef.current === offlineChaintracks
              try {
@@ -1035,6 +1051,83 @@ index 0000000..a16081c
 +  const anchor = spv.anchor ?? (HEADER_CHECKPOINTS as Record<string, HeaderCheckpoint | undefined>)[walletChain]
 +  if (!anchor) return undefined
 +  return { anchor, rules: spv.rules === 'regtest' ? regtestRules : undefined }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
+new file mode 100644
+index 0000000..3bd7c58
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
+@@ -0,0 +1,71 @@
++/**
++ * The monitor's header checks, under the chain's own difficulty rules.
++ *
++ * The toolbox monitor copies every header it handles (the chain tip TaskNewHeader polls, the
++ * header it then hands to `processNewBlockHeader`, reorg tips) through a check that requires
++ * mainnet proof of work. A header of a chain with other rules (regtest) can never pass it, so
++ * TaskNewHeader fails on every poll, `lastNewHeader` is never set and TaskCheckForProofs is
++ * never triggered: a payment received unmined stays `unproven` until the two-hour fallback.
++ *
++ * In spv mode the wallet's header chain is validated under the chain's rules (HeaderStore), so
++ * the monitor is given the same rules: the header must be well formed, its hash must be the
++ * hash of its fields, and it must satisfy `rules` for its declared bits.
++ */
++import { utils as chaintracksUtils } from '@bsv/wallet-toolbox-mobile'
++import type { HeaderRules } from '../headers/chainRules'
++
++const { validateHeaderFormat } = chaintracksUtils
++
++export interface MonitorBlockHeader {
++  version: number
++  previousHash: string
++  merkleRoot: string
++  time: number
++  bits: number
++  nonce: number
++  height: number
++  hash: string
++}
++
++/** A validated copy of `value` (only the eight header fields), or a throw naming `name`. */
++export function copyHeaderUnderRules(value: unknown, name: string, rules: HeaderRules): MonitorBlockHeader {
++  if (value === null || typeof value !== 'object') throw new Error(`The ${name} parameter must be a block header`)
++  const source = value as MonitorBlockHeader
++  const header: MonitorBlockHeader = {
++    version: source.version,
++    previousHash: source.previousHash,
++    merkleRoot: source.merkleRoot,
++    time: source.time,
++    bits: source.bits,
++    nonce: source.nonce,
++    height: source.height,
++    hash: source.hash
++  }
++  try {
++    validateHeaderFormat(header as never)
++    rules.validate({ height: header.height, hash: header.hash, bits: header.bits, time: header.time })
++  } catch (e) {
++    throw new Error(
++      `The ${name} parameter must be a canonical block header valid under ${rules.name} rules: ${(e as Error).message}`
++    )
++  }
++  return header
++}
++
++interface MonitorLike {
++  chaintracks: { findChainTipHeader: () => Promise<unknown> }
++  copyValidatedHeader?: (value: unknown, name: string) => MonitorBlockHeader
++  _tasks: { name: string }[]
++}
++
++/** Make `monitor` (and its NewHeader task) validate headers under `rules` instead of mainnet proof of work. */
++export function applyChainRulesToMonitorHeaders(monitor: MonitorLike, rules: HeaderRules): void {
++  monitor.copyValidatedHeader = (value, name) => copyHeaderUnderRules(value, name, rules)
++  const newHeader = monitor._tasks.find(t => t.name === 'NewHeader') as
++    | { getHeader?: () => Promise<MonitorBlockHeader> }
++    | undefined
++  if (newHeader) {
++    newHeader.getHeader = async () =>
++      copyHeaderUnderRules(await monitor.chaintracks.findChainTipHeader(), 'chain tip header', rules)
++  }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
 new file mode 100644

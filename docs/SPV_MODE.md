@@ -27,7 +27,7 @@ An opt-in mode in which the wallet gets chain data **only from one Arcade deploy
 | `EXPO_PUBLIC_SPV_SSE_URL` | Arcade's SSE listener (a separate port from its API), e.g. `http://<host>:8082`. Optional; without it, polling only. |
 | `EXPO_PUBLIC_SPV_ANCHOR_HEIGHT`, `EXPO_PUBLIC_SPV_ANCHOR_HASH` | Trust anchor of the header window, together. Required with `regtest` (the regtest genesis, `0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206`). |
 
-Local regtest runs through the `teratest` slot: `EXPO_PUBLIC_DEFAULT_CHAIN=teratest`. From an emulator or device use the host's LAN IP, not `localhost`.
+The app's default chain is hard-coded to `main` (`EXPO_PUBLIC_DEFAULT_CHAIN` is read nowhere), so local regtest runs either through the `teratest` slot after switching the network in the wallet-config screen, or on the `main` slot with the un-prefixed URLs pointing at the local stack (how the emulator run was done; with regtest rules that slot is the regtest chain). From a device use the host's LAN IP, not `localhost`; from the Android emulator use `10.0.2.2`.
 
 ## How it is carried
 
@@ -54,6 +54,8 @@ Live results (regtest): header sync from genesis equals the node's own roots; a 
 - **Zero-conf limits.** A tx stuck at `ACCEPTED_BY_NETWORK` (observed for a child of an unmined parent) is not "seen", so such a chain is refused until a block; there is no amount cap; offline, an unmined payment is refused because Arcade cannot be asked; the withdrawal of an accepted output on a later double-spend report is the toolbox's own path, not exercised live (Arcade's first-seen rule never flags the first tx on one node).
 - **A possible toolbox bug, not investigated:** the toolbox's `createServiceOptions` passes an empty string as the Arcade API key when none is set, and its SSE client rejects an empty key; in spv mode that is mapped to "absent" (`applySpvServices`), public mode is untouched.
 - **Address recovery and PeerPay** depend on indexer lookups and MessageBox; recovery from a mnemonic cannot discover funds in spv mode.
-- **Not run on a device or emulator.**
+- **Run in an Android emulator only** (debug build, against the local stack, exchanging payments with the Hodos browser; steps in the ChainBrowsers repo's `docs/cross-wallet-e2e.md`). Not run on a physical device or on iOS. That run found that the toolbox monitor checks every header it handles against the mainnet proof-of-work limit, so on regtest its new-header task failed on every poll and a payment received unmined was never proven (the headless tests run the proof task by hand and could not see it). `core/spv/monitorHeaders.ts` makes the monitor validate headers under the rules of the wallet's verified chain in spv mode.
+- **The monitor's first new-header poll runs before the header store is open**, fails once ("no verified header chain is available yet") and backs off five minutes, so proofs can lag right after the app starts. Seen in the emulator, left alone.
+- **What a page may not do in the app** (found in the emulator, not spv-specific): a page served from an IP address gets no wallet access, and a page may not use the BRC-29 payment protocol or list the `default` basket.
 - **`eas.json` commits WhatsOnChain API keys** (lines 51, 54, 57). Reported, not changed here.
 - **Not mine:** `__tests__/vault/guard.test.ts` fails on a clean checkout (5 tests); it is unrelated and left alone.

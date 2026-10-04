@@ -1,14 +1,16 @@
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-index 48fd575..1b08a89 100644
+index 48fd575..57ebe0b 100644
 --- a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-@@ -163,7 +163,12 @@ const DEFAULT_SETTINGS: WalletSettings = {
+@@ -163,7 +163,14 @@ const DEFAULT_SETTINGS: WalletSettings = {
  }
  import type { AppChain } from '../config'
  import { DEFAULT_STORAGE_URL, DEFAULT_CHAIN, ADMIN_ORIGINATOR, toWalletChain } from '../config'
 -import { getBackupUrl, getMandalaEndpoints } from '../toolboxConfig'
 +import { getBackupUrl, getChainMode, getMandalaEndpoints, getServiceConfig, getSpvOptions } from '../toolboxConfig'
 +import { applySpvServices } from '../spv/applySpvServices'
++import { makeSpvEventSourceClass } from '../spv/spvEventSource'
++import { guardZeroConfInternalize } from '../spv/zeroConf'
 +import { arcadeMerklePathOverride } from '../spv/arcadeMerklePath'
 +import { resolveHeaderSetup } from '../spv/headerSetup'
 +import { makeRemoteChaintracks } from '../spv/remoteChaintracks'
@@ -16,7 +18,7 @@ index 48fd575..1b08a89 100644
  import {
    DEFAULT_AUTO_APPROVE_THRESHOLD,
    AUTO_APPROVE_COOLDOWN_MS,
-@@ -220,7 +225,7 @@ import { logWithTimestamp } from '../logging'
+@@ -220,7 +227,7 @@ import { logWithTimestamp } from '../logging'
  import { recoverMnemonicWallet } from '../mnemonicWallet'
  import { vaultStore } from '../services/vault/vaultStore'
  import { guardVaultAccess } from '../services/vault/guard'
@@ -25,7 +27,7 @@ index 48fd575..1b08a89 100644
  import { StorageExpoSQLite } from '../storage'
  import { makeBuildGeneration } from './buildGeneration'
  import * as SQLite from 'expo-sqlite'
-@@ -275,7 +280,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
+@@ -275,7 +282,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
  import { SWEEP_INTERVAL_MS, runSweep, shouldSweepNow, sweptTotal } from '../pay/sweeper'
  import { formatAmount } from '../amountFormatHelpers'
  import { useTranslation } from 'react-i18next'
@@ -33,7 +35,7 @@ index 48fd575..1b08a89 100644
  import { expoHeaderFs } from '../headers/fs'
  import { HeaderStore } from '../headers/headerStore'
  import { OfflineFirstChaintracks } from '../headers/OfflineFirstChaintracks'
-@@ -1257,8 +1261,16 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1257,8 +1263,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
          // for root misses and the source for header sync. chaintracksUrlFor is
          // the single source of truth for these URLs — createServiceOptions
          // calls the same function, so there is exactly one table to edit.
@@ -45,14 +47,26 @@ index 48fd575..1b08a89 100644
 +        if (spvMode) assertSpvEndpoints(chain, { ...getServiceConfig(chain), arcUrl: arcUrlOverride || getServiceConfig(chain).arcUrl })
 +        // Refuse to build an spv wallet whose chain has no difficulty rules, before anything runs.
 +        if (spvMode) resolveHeaderSetup(walletChain, getSpvOptions(), 'spv')
-+        const remoteChaintracks = makeRemoteChaintracks(walletChain, chaintracksUrlFor(chain), getSpvOptions())
++        // spv: the Arcade API key (if the deployment needs one) goes to every Arcade client
++        // below, each only to its own base URL. Public mode is unchanged.
++        const spvArcKey = spvMode ? arcApiTokenOverride || getServiceConfig(chain).arcApiKey || undefined : undefined
++        const remoteChaintracks = makeRemoteChaintracks(walletChain, chaintracksUrlFor(chain), getSpvOptions(), spvArcKey)
 +        const offlineChaintracks = new OfflineFirstChaintracks(remoteChaintracks, getOnline, walletChain, {
 +          strict: spvMode
 +        })
          offlineChaintracksRef.current = offlineChaintracks
  
          // Passing offlineChaintracks here does two things, and createServices
-@@ -1355,6 +1367,16 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1292,7 +1309,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+         services.postBeefServices.remove('TaalArcBeef')
+         services.postBeefServices.remove('Bitails')
+         services.postBeefServices.remove('WhatsOnChain')
+-        services.postBeefServices.add(createArcadeBroadcastService(serviceOptions.arcUrl!, callbackToken))
++        services.postBeefServices.add(createArcadeBroadcastService(serviceOptions.arcUrl!, callbackToken, spvArcKey))
+         if (chain === 'main' || chain === 'test') {
+           const taalArcUrl = chain === 'main' ? 'https://arc.taal.com' : 'https://arc-test.taal.com'
+           services.postBeefServices.add(createTaalBroadcastService(taalArcUrl, serviceOptions.taalApiKey))
+@@ -1355,7 +1372,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
            getMerklePathSvc.add({ name: 'Bitails', service: bitailsGetMerklePath })
          }
  
@@ -61,15 +75,37 @@ index 48fd575..1b08a89 100644
 +        // the order the providers above were registered in.
 +        if (spvMode) {
 +          applySpvServices(services, {
-+            ...arcadeMerklePathOverride(getSpvOptions(), serviceOptions.arcUrl!, offlineChaintracks as never),
++            ...arcadeMerklePathOverride(getSpvOptions(), serviceOptions.arcUrl!, offlineChaintracks as never, spvArcKey),
 +            headers: offlineChaintracks
 +          })
 +        }
 +
          const wallet = new Wallet(signer, services, undefined, privilegedKeyManager)
++        // spv: an unmined payment is accepted only once Arcade has seen it on the network. Wrapped on
++        // the Wallet itself, so every route in (page bridge, in-app, nearby, token drain) is covered.
++        if (spvMode) {
++          ;(wallet as any).internalizeAction = guardZeroConfInternalize(wallet.internalizeAction.bind(wallet) as any, {
++            arcUrl: serviceOptions.arcUrl!,
++            apiKey: spvArcKey
++          })
++        }
          // Consumed only by the toolbox storage-boundary hook. The value is set
          // by trusted host code and compared with WalletClient's originator;
-@@ -2316,11 +2338,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+         // external action fields cannot manufacture this authorization bit.
+@@ -1874,7 +1909,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+           }
+           const monitorOptions = createWalletMonitorOptions(walletChain, storageManager, services, offlineChaintracks)
+           monitorOptions.callbackToken = callbackToken
+-          monitorOptions.EventSourceClass = loadQuietEventSourceClass()
++          // spv: the SSE listener is a separate port from Arcade's API. With no SSE URL the class is
++          // undefined and the task logs "SSE disabled": proofs arrive by polling.
++          monitorOptions.EventSourceClass = spvMode
++            ? makeSpvEventSourceClass(loadQuietEventSourceClass(), serviceOptions.arcUrl!, getSpvOptions().sseUrl)
++            : loadQuietEventSourceClass()
+           monitorOptions.onTransactionStatusChanged = async (_txid: string, _newStatus: string) => {
+             setTxStatusVersion(v => v + 1)
+             // The database moved, so the backup log has something to catch up on.
+@@ -2316,11 +2355,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
              // a store) that belongs to a different build.
              const stillCurrent = () => offlineChaintracksRef.current === offlineChaintracks
              try {
@@ -710,12 +746,37 @@ index 40807f0..bd7943d 100644
 -  return { added, tipHeight: store.tipHeight, presentHeight }
 +  return { added, tipHeight: store.tipHeight, presentHeight, reorgDepth, rejectedFork }
  }
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts b/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
+index c227bba..76e6a32 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
+@@ -1,5 +1,6 @@
+ import { Beef, Transaction, Utils } from '@bsv/sdk'
+ import type { PostBeefResult, PostTxResultForTxid } from '../toolboxTypes'
++import { arcadeAuthHeaders } from '../spv/arcadeAuth'
+ 
+ const BROADCAST_TIMEOUT_MS = 30_000
+ 
+@@ -289,10 +290,11 @@ function createArcBroadcastService(
+ /**
+  * Arcade broadcast service — EF format with callback token for SSE updates.
+  */
+-export function createArcadeBroadcastService(arcadeUrl: string, callbackToken: string) {
++export function createArcadeBroadcastService(arcadeUrl: string, callbackToken: string, apiKey?: string | null) {
+   return createArcBroadcastService('Arcade', arcadeUrl, '/tx', {
+     'X-CallbackToken': callbackToken,
+-    'X-FullStatusUpdates': 'true'
++    'X-FullStatusUpdates': 'true',
++    ...arcadeAuthHeaders(apiKey)
+   })
+ }
+ 
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts
 new file mode 100644
-index 0000000..eb2fa5d
+index 0000000..f0c36f4
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,105 @@
 +/**
 + * Narrows a `Services` instance to Arcade only, for spv chain mode.
 + *
@@ -782,6 +843,11 @@ index 0000000..eb2fa5d
 +export function applySpvServices(services: Services, options: SpvServiceOptions = {}): void {
 +  const s = services as unknown as Record<string, Collection>
 +
++  // The toolbox SSE client accepts an absent API key but rejects an empty one, and
++  // createServiceOptions produces '' when there is no key.
++  const arcadeConfig = (services as any).options?.arcadeConfig
++  if (arcadeConfig && !arcadeConfig.apiKey) arcadeConfig.apiKey = undefined
++
 +  keepArcadeOnly(s.getMerklePathServices)
 +  if (options.headers) {
 +    const headers = options.headers
@@ -816,12 +882,37 @@ index 0000000..eb2fa5d
 +    'address history lookup'
 +  )
 +}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts
+new file mode 100644
+index 0000000..836d298
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts
+@@ -0,0 +1,19 @@
++/**
++ * The Authorization header for an Arcade deployment that requires an API key.
++ * Same scheme the toolbox's own Arcade and SSE clients use (`Bearer <key>`).
++ *
++ * Every spv Arcade client takes the key at construction and sends it only to its
++ * own base URL, and `assertSpvEndpoints` has already required https (or a
++ * local-development host) for that URL. A key that could split or bloat a header
++ * is refused, and is never put in an error message.
++ */
++const MAX_KEY = 4096
++
++export function arcadeAuthHeaders(apiKey: string | null | undefined): Record<string, string> {
++  const key = (apiKey ?? '').trim()
++  if (key === '') return {}
++  if (key.length > MAX_KEY || /[\u0000-\u001f\u007f]/.test(key)) {
++    throw new Error('Arcade API key is not valid for an HTTP header')
++  }
++  return { Authorization: `Bearer ${key}` }
++}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts
 new file mode 100644
-index 0000000..c01c40d
+index 0000000..d1a048f
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,78 @@
 +/**
 + * A `getMerklePath` service for spv mode: the BUMP Arcade reports for a mined
 + * transaction, paired with the header from the wallet's OWN verified chain.
@@ -839,6 +930,7 @@ index 0000000..c01c40d
 + * next header sync, and is never stored unverified.
 + */
 +import { MerklePath } from '@bsv/sdk'
++import { arcadeAuthHeaders } from './arcadeAuth'
 +
 +type Header = { height: number; hash: string; merkleRoot: string } & Record<string, unknown>
 +
@@ -853,14 +945,16 @@ index 0000000..c01c40d
 +export function createArcadeMerklePathService(
 +  arcUrl: string,
 +  getVerifiedHeader: (height: number) => Promise<Header | undefined>,
-+  fetcher: typeof fetch = (...a) => fetch(...a)
++  fetcher: typeof fetch = (...a) => fetch(...a),
++  apiKey?: string | null
 +): (txid: string) => Promise<MerklePathServiceResult> {
 +  const base = arcUrl.replace(/\/+$/, '')
++  const headers = arcadeAuthHeaders(apiKey)
 +  return async txid => {
 +    if (!/^[0-9a-fA-F]{64}$/.test(txid)) throw new Error('getMerklePath: txid must be 64 hex characters')
 +    const name = 'Arcade'
 +    const note = (what: string, extra: Record<string, unknown> = {}) => [{ what, when: new Date().toISOString(), ...extra }]
-+    const res = await fetcher(`${base}/tx/${txid.toLowerCase()}`)
++    const res = await fetcher(`${base}/tx/${txid.toLowerCase()}`, { headers })
 +    if (res.status === 404) return { name, notes: note('getMerklePathNoData') }
 +    if (!res.ok) return { name, notes: note('getMerklePathBadStatus', { httpStatus: res.status }) }
 +    const body = (await res.json()) as { merklePath?: unknown; blockHeight?: unknown }
@@ -891,10 +985,11 @@ index 0000000..c01c40d
 +export function arcadeMerklePathOverride(
 +  spv: { rules?: 'default' | 'regtest' },
 +  arcUrl: string,
-+  tracker: { findHeaderForHeight(height: number): Promise<Header | undefined> }
++  tracker: { findHeaderForHeight(height: number): Promise<Header | undefined> },
++  apiKey?: string | null
 +): { merklePath: (txid: string) => Promise<MerklePathServiceResult> } | undefined {
 +  if (spv.rules !== 'regtest') return undefined
-+  return { merklePath: createArcadeMerklePathService(arcUrl, h => tracker.findHeaderForHeight(h)) }
++  return { merklePath: createArcadeMerklePathService(arcUrl, h => tracker.findHeaderForHeight(h), undefined, apiKey) }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/headerSetup.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/headerSetup.ts
 new file mode 100644
@@ -943,10 +1038,10 @@ index 0000000..a16081c
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
 new file mode 100644
-index 0000000..d582587
+index 0000000..7e7c85c
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,89 @@
 +/**
 + * A minimal chaintracks client for the header sync: present height and raw
 + * header bytes, nothing else, and no judgement of what it returns.
@@ -959,6 +1054,8 @@ index 0000000..d582587
 + *
 + * Speaks the Arcade chaintracks v1 envelope: `{ "status": "success", "value": … }`.
 + */
++import { arcadeAuthHeaders } from './arcadeAuth'
++
 +const HEADER_BYTES = 80
 +const MAX_BODY_CHARS = 8 * 1024 * 1024
 +const TIMEOUT_MS = 30_000
@@ -967,19 +1064,22 @@ index 0000000..d582587
 +  /** `false` tells the Monitor not to subscribe: there is no event stream here. */
 +  readonly supportsReorgEvents = false
 +  private readonly base: string
++  private readonly authHeaders: Record<string, string>
 +
 +  constructor(
 +    baseUrl: string,
-+    private readonly fetcher: typeof fetch = (...a) => fetch(...a)
++    private readonly fetcher: typeof fetch = (...a) => fetch(...a),
++    apiKey?: string | null
 +  ) {
 +    this.base = baseUrl.replace(/\/+$/, '')
++    this.authHeaders = arcadeAuthHeaders(apiKey)
 +  }
 +
 +  private async get(path: string): Promise<unknown> {
 +    const ctl = new AbortController()
 +    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
 +    try {
-+      const res = await this.fetcher(`${this.base}${path}`, { signal: ctl.signal })
++      const res = await this.fetcher(`${this.base}${path}`, { signal: ctl.signal, headers: this.authHeaders })
 +      if (!res.ok) throw new Error(`chaintracks ${path.split('?')[0]} answered HTTP ${res.status}`)
 +      const text = await res.text()
 +      if (text.length > MAX_BODY_CHARS) throw new Error('chaintracks response is too large')
@@ -1033,10 +1133,10 @@ index 0000000..d582587
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts
 new file mode 100644
-index 0000000..8083c94
+index 0000000..ddbee76
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,19 @@
 +/**
 + * The remote the header sync reads from. The toolbox's own client rejects any
 + * header above the mainnet proof-of-work limit, so a chain with other rules
@@ -1050,17 +1150,83 @@ index 0000000..8083c94
 +export function makeRemoteChaintracks(
 +  walletChain: 'main' | 'test' | 'ttn',
 +  url: string,
-+  spv: SpvOptions
++  spv: SpvOptions,
++  apiKey?: string | null
 +): ChaintracksClientApi {
-+  if (spv.rules === 'regtest') return new RawChaintracksClient(url) as unknown as ChaintracksClientApi
++  if (spv.rules === 'regtest') return new RawChaintracksClient(url, undefined, apiKey) as unknown as ChaintracksClientApi
 +  return new ChaintracksServiceClient(walletChain, url)
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts
+new file mode 100644
+index 0000000..27903ee
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts
+@@ -0,0 +1,22 @@
++/**
++ * Which origins spv mode will send chain traffic (and an Arcade API key) to:
++ * https anywhere, plain http only to a local-development host, and never a URL
++ * that carries credentials. The same rule `toolboxConfig` applies to the backup
++ * and Mandala origins (`isAllowedServiceOrigin`); kept here as its own copy
++ * because `toolboxConfig` imports this package's spv code. A test pins the two
++ * together.
++ */
++const PRIVATE_HOST =
++  /^(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})$/
++
++export function isAllowedSpvOrigin(url: string): boolean {
++  let parsed: URL
++  try {
++    parsed = new URL(url)
++  } catch {
++    return false
++  }
++  if (parsed.username || parsed.password) return false
++  if (parsed.protocol === 'https:') return true
++  return parsed.protocol === 'http:' && PRIVATE_HOST.test(parsed.hostname)
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts
+new file mode 100644
+index 0000000..9167386
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts
+@@ -0,0 +1,31 @@
++/**
++ * Arcade serves its status stream (SSE) from a separate listener from its API
++ * (spv-testnet: API :8080, SSE :8082), but the toolbox's `ArcSSEClient` builds
++ * `${arcadeUrl}/events?callbackToken=…`. This wraps the app's EventSource class so
++ * that URL, and only that URL, is moved to the SSE listener; the headers (including
++ * the API key and Last-Event-ID) pass through unchanged.
++ *
++ * With no SSE URL there is no class, so the toolbox's task reports "SSE disabled"
++ * and proofs arrive by polling alone. A URL that is not the Arcade events URL is
++ * refused, so the callback token and API key cannot be sent anywhere else.
++ */
++type EventSourceCtor = new (url: any, options?: any) => any
++
++export function makeSpvEventSourceClass(
++  Base: EventSourceCtor,
++  arcUrl: string,
++  sseUrl: string | undefined
++): EventSourceCtor | undefined {
++  if (!sseUrl) return undefined
++  const from = `${arcUrl.replace(/\/+$/, '')}/events`
++  const to = `${sseUrl.replace(/\/+$/, '')}/events`
++  return class SpvEventSource extends Base {
++    constructor(url: any, options?: any) {
++      const u = String(url)
++      if (!(u === from || u.startsWith(`${from}?`))) {
++        throw new Error('spv mode: refusing to open an event stream to a URL that is not the Arcade events URL')
++      }
++      super(`${to}${u.slice(from.length)}`, options)
++    }
++  }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts
 new file mode 100644
-index 0000000..2091deb
+index 0000000..98093a2
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts
-@@ -0,0 +1,114 @@
+@@ -0,0 +1,122 @@
 +/**
 + * spv chain mode: the wallet gets chain data only from the configured Arcade
 + * (broadcast, status, proofs, SSE) and Arcade's chaintracks (headers), and
@@ -1080,6 +1246,7 @@ index 0000000..2091deb
 + * talks to MessageBox, price and identity services that are not chain state.
 + */
 +import type { AppChain } from '../config'
++import { isAllowedSpvOrigin } from './serviceOrigin'
 +
 +export type ChainMode = 'public' | 'spv'
 +
@@ -1161,31 +1328,141 @@ index 0000000..2091deb
 +/** spv needs an explicit Arcade and chaintracks for the chain, neither of them a public indexer. */
 +export function assertSpvEndpoints(
 +  chain: AppChain,
-+  svc: { arcUrl?: string | null; chaintracksUrl?: string | null }
++  svc: { arcUrl?: string | null; chaintracksUrl?: string | null; sseUrl?: string | null }
 +): void {
 +  const p = ENV_PREFIX[chain]
 +  if (!svc.arcUrl) throw new Error(`spv mode needs an Arcade URL for ${chain}: set ${p}ARC_URL`)
 +  if (!svc.chaintracksUrl) throw new Error(`spv mode needs a chaintracks URL for ${chain}: set ${p}CHAINTRACKS_URL`)
-+  for (const [name, url] of [
++  const urls: (readonly [string, string])[] = [
 +    ['Arcade', svc.arcUrl],
 +    ['chaintracks', svc.chaintracksUrl]
-+  ] as const) {
++  ]
++  if (svc.sseUrl) urls.push(['SSE', svc.sseUrl])
++  for (const [name, url] of urls) {
 +    if (isBlockedIndexerUrl(url)) {
 +      throw new Error(`spv mode: the ${name} URL for ${chain} is a public indexer, not an Arcade deployment`)
 +    }
++    if (!isAllowedSpvOrigin(url)) {
++      throw new Error(
++        `spv mode: the ${name} URL for ${chain} must be https (plain http is allowed only for a local-development host) and carry no credentials`
++      )
++    }
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts
+new file mode 100644
+index 0000000..c7707e6
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts
+@@ -0,0 +1,96 @@
++/**
++ * Zero-conf for spv mode: accept a payment whose transaction is not mined yet, but
++ * only once Arcade has SEEN it on the network.
++ *
++ * The toolbox will internalize a BEEF whose subject has no merkle proof (its
++ * ancestors must be proven) and make the output spendable at once, with no check that
++ * the network ever saw the transaction. A sender could hand over a transaction it
++ * never broadcast, or that conflicts with one already on the network. This wrapper
++ * closes that: before `internalizeAction`, every transaction in the BEEF that has no
++ * BUMP of its own must be `SEEN_ON_NETWORK` (or better) on Arcade, with no
++ * conflict. Anything else is refused, and the wallet is not called, so nothing is
++ * stored. Unlike Hodos, which keeps such an output unspendable until it is mined, a
++ * payment that is not seen yet is refused rather than parked; the sender (or a retry)
++ * presents it again once it has been broadcast.
++ *
++ * A fully proven BEEF is passed straight through without a network call. Input that
++ * cannot be read as a BEEF is left to the wallet, which rejects it itself.
++ *
++ * The toolbox then broadcasts the unmined tx itself (its request is `unsent`), which
++ * is also what registers this wallet's callback token with Arcade for push events.
++ */
++import { Beef } from '@bsv/sdk'
++import { arcadeAuthHeaders } from './arcadeAuth'
++
++const SEEN = new Set(['SEEN_ON_NETWORK', 'SEEN_ON_MULTIPLE_NODES', 'SEEN_MULTIPLE_NODES', 'MINED', 'IMMUTABLE'])
++const CONFLICT = new Set(['REJECTED', 'DOUBLE_SPEND_ATTEMPTED', 'SEEN_IN_ORPHAN_MEMPOOL'])
++
++export interface ZeroConfOptions {
++  arcUrl: string
++  apiKey?: string | null
++  fetcher?: typeof fetch
++  /** How long to wait for Arcade to have seen a tx (it usually takes well under a second). Default 4 s. */
++  waitMs?: number
++  pollMs?: number
++}
++
++type Verdict = { ok: true } | { ok: false; reason: string }
++
++async function checkSeen(txid: string, o: Required<Pick<ZeroConfOptions, 'waitMs' | 'pollMs'>> & {
++  base: string
++  headers: Record<string, string>
++  fetcher: typeof fetch
++}): Promise<Verdict> {
++  const end = Date.now() + o.waitMs
++  let last = 'unknown to Arcade'
++  for (;;) {
++    try {
++      const res = await o.fetcher(`${o.base}/tx/${txid}`, { headers: o.headers })
++      if (res.ok) {
++        const body = (await res.json()) as { txStatus?: string }
++        const st = String(body.txStatus ?? '')
++        if (CONFLICT.has(st)) return { ok: false, reason: `Arcade reports ${st}` }
++        if (SEEN.has(st)) return { ok: true }
++        last = st === '' ? 'no status' : st
++      } else {
++        last = res.status === 404 ? 'unknown to Arcade' : `Arcade answered HTTP ${res.status}`
++      }
++    } catch {
++      last = 'Arcade could not be reached'
++    }
++    if (Date.now() >= end) return { ok: false, reason: `not seen on the network (last status: ${last})` }
++    await new Promise(r => setTimeout(r, o.pollMs))
++  }
++}
++
++export function guardZeroConfInternalize<A extends { tx: number[] }, R>(
++  inner: (args: A, originator?: string) => Promise<R>,
++  options: ZeroConfOptions
++): (args: A, originator?: string) => Promise<R> {
++  const base = options.arcUrl.replace(/\/+$/, '')
++  const headers = arcadeAuthHeaders(options.apiKey)
++  const fetcher = options.fetcher ?? ((...a: Parameters<typeof fetch>) => fetch(...a))
++  const waitMs = options.waitMs ?? 4000
++  const pollMs = options.pollMs ?? 250
++
++  return async (args, originator) => {
++    let unproven: string[] = []
++    try {
++      const beef = Beef.fromBinary(args.tx)
++      unproven = beef.txs.filter(t => !t.isTxidOnly && !t.hasProof).map(t => t.txid)
++    } catch {
++      return inner(args, originator)
++    }
++    if (unproven.length === 0) return inner(args, originator)
++
++    const verdicts = await Promise.all(unproven.map(txid => checkSeen(txid, { base, headers, fetcher, waitMs, pollMs })))
++    const bad = verdicts.findIndex(v => !v.ok)
++    if (bad >= 0) {
++      const v = verdicts[bad] as { ok: false; reason: string }
++      throw new Error(
++        `zero-conf: transaction ${unproven[bad]} is not mined and ${v.reason}; not accepting an unmined payment until Arcade has seen it`
++      )
++    }
++    return inner(args, originator)
 +  }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts b/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
-index 5d8debf..a912640 100644
+index 5d8debf..20a3935 100644
 --- a/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
-@@ -1,4 +1,5 @@
+@@ -1,4 +1,6 @@
  import type { AppChain } from './config'
 +import { installIndexerGuard, parseChainMode, type ChainMode } from './spv/spvMode'
++import { isAllowedSpvOrigin } from './spv/serviceOrigin'
  
  /**
   * Service endpoints and API keys for one chain.
-@@ -108,6 +109,21 @@ export interface ToolboxConfig {
+@@ -108,6 +110,23 @@ export interface ToolboxConfig {
     * never read from process.env here.
     */
    vaultEnabled?: boolean
@@ -1204,10 +1481,12 @@ index 5d8debf..a912640 100644
 +  rules?: 'default' | 'regtest'
 +  /** Trust anchor for the header window, replacing the built-in checkpoint of the chain. */
 +  anchor?: { height: number; hash: string }
++  /** Arcade's SSE listener (a separate port from its API). Without it there is no push; proofs arrive by polling. */
++  sseUrl?: string
  }
  
  interface ResolvedConfig {
-@@ -116,6 +132,8 @@ interface ResolvedConfig {
+@@ -116,6 +135,8 @@ interface ResolvedConfig {
    mandala: Partial<Record<AppChain, MandalaEndpointConfig>>
    handleRegistry: Partial<Record<AppChain, HandleRegistryConfig>>
    vaultEnabled: boolean
@@ -1216,7 +1495,7 @@ index 5d8debf..a912640 100644
  }
  
  let current: ResolvedConfig | null = null
-@@ -193,8 +211,45 @@ export function configureToolbox(config: ToolboxConfig): void {
+@@ -193,8 +214,53 @@ export function configureToolbox(config: ToolboxConfig): void {
      services: config.services ?? {},
      mandala: config.mandala ?? {},
      handleRegistry: config.handleRegistry ?? {},
@@ -1224,7 +1503,7 @@ index 5d8debf..a912640 100644
 +    vaultEnabled: config.vaultEnabled === true,
 +    chainMode: parseChainMode(config.chainMode),
 +    spv: normalizeSpvOptions(config.spv)
-   }
++  }
 +  // Re-running configureToolbox replaces the configuration wholesale, so the
 +  // fetch guard follows the mode: installed for spv, removed for public.
 +  removeIndexerGuard?.()
@@ -1241,13 +1520,21 @@ index 5d8debf..a912640 100644
 +      throw new Error(`configureToolbox: spv.rules must be 'default' or 'regtest', got ${String(spv.rules)}`)
 +    }
 +    out.rules = spv.rules
-+  }
+   }
 +  if (spv.anchor !== undefined) {
 +    const { height, hash } = spv.anchor
 +    if (!Number.isSafeInteger(height) || height < 0 || typeof hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hash)) {
 +      throw new Error('configureToolbox: spv.anchor must be { height: non-negative integer, hash: 64 hex characters }')
 +    }
 +    out.anchor = { height, hash: hash.toLowerCase() }
++  }
++  if (spv.sseUrl !== undefined) {
++    if (typeof spv.sseUrl !== 'string' || !isAllowedSpvOrigin(spv.sseUrl)) {
++      throw new Error(
++        'configureToolbox: spv.sseUrl must be an https URL (plain http only for a local-development host) with no credentials'
++      )
++    }
++    out.sseUrl = spv.sseUrl
 +  }
 +  return out
 +}

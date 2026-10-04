@@ -171,6 +171,136 @@ const controls = [
     from: "if (spv.rules === 'regtest' && !spv.anchor) {",
     to: 'if (false) {',
     tests: '__tests__/spv/headerSetup'
+  },
+  // ── https-only, Arcade API key, SSE, zero-conf ───────────────────────────────────────────────
+  {
+    rule: 'origin: plain http is allowed only to a local-development host',
+    file: `${T}/spv/serviceOrigin.ts`,
+    from: "return parsed.protocol === 'http:' && PRIVATE_HOST.test(parsed.hostname)",
+    to: 'return true',
+    tests: '__tests__/spv/serviceOrigin'
+  },
+  {
+    rule: 'origin: an origin with credentials is refused',
+    file: `${T}/spv/serviceOrigin.ts`,
+    from: 'if (parsed.username || parsed.password) return false',
+    to: '',
+    tests: '__tests__/spv/serviceOrigin'
+  },
+  {
+    rule: 'endpoints: the Arcade/chaintracks/SSE scheme is checked',
+    file: `${T}/spv/spvMode.ts`,
+    from: 'if (!isAllowedSpvOrigin(url)) {',
+    to: 'if (false) {',
+    tests: '__tests__/spv/serviceOrigin'
+  },
+  {
+    rule: 'auth: a key that could split a header is refused',
+    file: `${T}/spv/arcadeAuth.ts`,
+    from: 'if (key.length > MAX_KEY || /[\\u0000-\\u001f\\u007f]/.test(key)) {',
+    to: 'if (key.length > MAX_KEY) {',
+    tests: '__tests__/spv/arcadeAuth'
+  },
+  {
+    rule: 'auth: the raw chaintracks client sends the key',
+    file: `${T}/spv/rawChaintracksClient.ts`,
+    from: 'headers: this.authHeaders',
+    to: 'headers: {}',
+    tests: '__tests__/spv/arcadeAuth'
+  },
+  {
+    rule: 'auth: the Arcade proof service sends the key',
+    file: `${T}/spv/arcadeMerklePath.ts`,
+    from: 'await fetcher(`${base}/tx/${txid.toLowerCase()}`, { headers })',
+    to: 'await fetcher(`${base}/tx/${txid.toLowerCase()}`)',
+    tests: '__tests__/spv/arcadeAuth'
+  },
+  {
+    rule: 'auth: the broadcast service sends the key',
+    file: `${T}/services/arcadeBroadcastProvider.ts`,
+    from: '...arcadeAuthHeaders(apiKey)',
+    to: '',
+    tests: '__tests__/spv/arcadeAuth'
+  },
+  {
+    rule: 'auth: the zero-conf status check sends the key',
+    file: `${T}/spv/zeroConf.ts`,
+    from: 'await o.fetcher(`${o.base}/tx/${txid}`, { headers: o.headers })',
+    to: 'await o.fetcher(`${o.base}/tx/${txid}`)',
+    tests: '__tests__/spv/zeroConf'
+  },
+  {
+    rule: 'auth: LIVE, a wallet with the key reaches an Arcade that requires it',
+    file: `${T}/spv/rawChaintracksClient.ts`,
+    from: 'headers: this.authHeaders',
+    to: 'headers: {}',
+    tests: '__tests__/spv/live/auth',
+    env: { SPV_LIVE: '1' }
+  },
+  {
+    rule: 'sse: the event stream only ever goes to the Arcade events URL',
+    file: `${T}/spv/spvEventSource.ts`,
+    from: 'if (!(u === from || u.startsWith(`${from}?`))) {',
+    to: 'if (false) {',
+    tests: '__tests__/spv/spvEventSource'
+  },
+  {
+    rule: 'sse: the events URL moves to the SSE listener',
+    file: `${T}/spv/spvEventSource.ts`,
+    from: 'super(`${to}${u.slice(from.length)}`, options)',
+    to: 'super(u, options)',
+    tests: '__tests__/spv/spvEventSource'
+  },
+  {
+    rule: 'sse: no SSE URL means no push class',
+    file: `${T}/spv/spvEventSource.ts`,
+    from: 'if (!sseUrl) return undefined',
+    to: "if (!sseUrl) sseUrl = 'http://localhost:1'",
+    tests: '__tests__/spv/spvEventSource'
+  },
+  {
+    rule: 'sse: an empty API key is made absent (the toolbox SSE client rejects an empty one)',
+    file: `${T}/spv/applySpvServices.ts`,
+    from: 'if (arcadeConfig && !arcadeConfig.apiKey) arcadeConfig.apiKey = undefined',
+    to: "if (arcadeConfig && !arcadeConfig.apiKey) arcadeConfig.apiKey = ''",
+    tests: '__tests__/spv/spvServices'
+  },
+  {
+    rule: 'zero-conf: an unmined payment Arcade has not seen is refused',
+    file: `${T}/spv/zeroConf.ts`,
+    from: 'if (bad >= 0) {',
+    to: 'if (false) {',
+    tests: '__tests__/spv/zeroConf'
+  },
+  {
+    rule: 'zero-conf: a conflicting payment is refused at once',
+    file: `${T}/spv/zeroConf.ts`,
+    from: "if (CONFLICT.has(st)) return { ok: false, reason: `Arcade reports ${st}` }",
+    to: '',
+    tests: '__tests__/spv/zeroConf'
+  },
+  {
+    rule: 'zero-conf: only SEEN or better counts as seen',
+    file: `${T}/spv/zeroConf.ts`,
+    from: "const SEEN = new Set(['SEEN_ON_NETWORK', 'SEEN_ON_MULTIPLE_NODES', 'SEEN_MULTIPLE_NODES', 'MINED', 'IMMUTABLE'])",
+    to: "const SEEN = new Set(['SEEN_ON_NETWORK', 'SEEN_ON_MULTIPLE_NODES', 'SEEN_MULTIPLE_NODES', 'MINED', 'IMMUTABLE', 'ACCEPTED_BY_NETWORK', 'RECEIVED'])",
+    tests: '__tests__/spv/zeroConf'
+  },
+  {
+    rule: 'sse: LIVE, events come from the SSE listener, not the API port',
+    file: `${T}/spv/spvEventSource.ts`,
+    from: 'super(`${to}${u.slice(from.length)}`, options)',
+    to: 'super(u, options)',
+    tests: '__tests__/spv/live/sse',
+    env: { SPV_LIVE: '1' }
+  },
+  {
+    rule: 'zero-conf: LIVE, the wallet refuses an unseen and a conflicting payment',
+    file: `${T}/spv/zeroConf.ts`,
+    from: 'if (bad >= 0) {',
+    to: 'if (false) {',
+    tests: '__tests__/spv/live/zeroconf',
+    env: { SPV_LIVE: '1' }
   }
 ]
 

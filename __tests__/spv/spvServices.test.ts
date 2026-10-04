@@ -97,6 +97,23 @@ describe('applySpvServices', () => {
     }
   })
 
+  it('an empty Arcade API key becomes absent, because the toolbox SSE client rejects an empty one', () => {
+    const s = build()
+    expect(s.options.arcadeConfig.apiKey).toBe('') // control: what createServiceOptions produces with no key
+    applySpvServices(s)
+    expect(s.options.arcadeConfig.apiKey).toBeUndefined()
+  })
+
+  it('keeps a real Arcade API key', () => {
+    configureToolbox({
+      backupUrl: null,
+      services: { test: { arcUrl: 'http://192.168.1.20:8080', chaintracksUrl: 'http://192.168.1.20:8083/chaintracks/v1', arcApiKey: 'real-key' } }
+    })
+    const { services } = createServices('test', 'tok', RATE)
+    applySpvServices(services as never)
+    expect((services as any).options.arcadeConfig.apiKey).toBe('real-key')
+  })
+
   it('leaves hashToHeader alone when no verified source is given (control)', async () => {
     const s = build()
     const original = s.hashToHeader

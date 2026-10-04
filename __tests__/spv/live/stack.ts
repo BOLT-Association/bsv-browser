@@ -11,6 +11,7 @@ import { MerklePath, P2PKH, PrivateKey, Transaction } from '@bsv/sdk'
 export const LIVE = process.env.SPV_LIVE === '1'
 export const ARCADE = process.env.ARCADE_URL ?? 'http://localhost:8080'
 export const CHAINTRACKS = process.env.CHAINTRACKS_URL ?? 'http://localhost:8083/chaintracks/v1'
+export const ARCADE_SSE = process.env.ARCADE_SSE_URL ?? 'http://localhost:8082'
 export const RPC_URL = process.env.RPC_URL ?? 'http://localhost:29292'
 /** Bitcoin regtest genesis, the trust anchor of the regtest header window. */
 export const REGTEST_GENESIS = '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206'
@@ -90,6 +91,8 @@ export async function chaintracksHeader(height: number): Promise<{ hash: string;
 const MINER_WIF = process.env.MINER_WIF ?? 'L56TgyTpDdvL3W24SMoALYotibToSCySQeo4pThLKxw6EFR6f93Q'
 const minerKey = PrivateKey.fromWif(MINER_WIF)
 const minerScript = new P2PKH().lock(minerKey.toPublicKey().toHash())
+export const minerLockingScript = minerScript
+export const minerPrivateKey = minerKey
 
 export interface ArcadeStatus {
   txid?: string

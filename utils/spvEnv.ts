@@ -15,8 +15,10 @@ export function spvOptionsFromEnv(env: Env): SpvOptions | undefined {
   const rules = env.EXPO_PUBLIC_SPV_RULES?.trim()
   const height = env.EXPO_PUBLIC_SPV_ANCHOR_HEIGHT?.trim()
   const hash = env.EXPO_PUBLIC_SPV_ANCHOR_HASH?.trim()
+  const sseUrl = env.EXPO_PUBLIC_SPV_SSE_URL?.trim()
   const out: SpvOptions = {}
   if (rules) out.rules = rules as SpvOptions['rules']
+  if (sseUrl) out.sseUrl = sseUrl
   if (height || hash) {
     if (!height || !hash) {
       throw new Error('spv anchor needs both EXPO_PUBLIC_SPV_ANCHOR_HEIGHT and EXPO_PUBLIC_SPV_ANCHOR_HASH')

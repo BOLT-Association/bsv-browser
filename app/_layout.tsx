@@ -61,7 +61,8 @@ configureToolbox({
   spv: spvOptionsFromEnv({
     EXPO_PUBLIC_SPV_RULES: process.env.EXPO_PUBLIC_SPV_RULES,
     EXPO_PUBLIC_SPV_ANCHOR_HEIGHT: process.env.EXPO_PUBLIC_SPV_ANCHOR_HEIGHT,
-    EXPO_PUBLIC_SPV_ANCHOR_HASH: process.env.EXPO_PUBLIC_SPV_ANCHOR_HASH
+    EXPO_PUBLIC_SPV_ANCHOR_HASH: process.env.EXPO_PUBLIC_SPV_ANCHOR_HASH,
+    EXPO_PUBLIC_SPV_SSE_URL: process.env.EXPO_PUBLIC_SPV_SSE_URL
   }),
   services: {
     main: {

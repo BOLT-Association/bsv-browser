@@ -2,6 +2,7 @@ import { OfflineFirstChaintracks } from '@bsv/expo-wallet-toolbox/core/headers/O
 import { HeaderStore } from '@bsv/expo-wallet-toolbox/core/headers/headerStore'
 import { memoryHeaderFs } from '@bsv/expo-wallet-toolbox/core/headers/fs'
 import { Utils } from '@bsv/sdk'
+import { mineHeader } from './spv/helpers'
 
 const ANCHOR = { height: 0, hash: '00'.repeat(32) }
 
@@ -202,23 +203,29 @@ describe('OfflineFirstChaintracks', () => {
     const rootFor = (height: number) => height.toString(16).padStart(2, '0').repeat(32)
     const HEADER_BYTES = 80
 
-    /** Seeds a HeaderStore's persisted files directly (bypassing append's
-     * proof-of-work check) with `count` headers starting at height 1, so a
-     * window big enough to have a body outside the last-6 tail can be built
-     * without mining real headers. */
+    /** Seeds a HeaderStore's persisted files directly (bypassing append) with
+     * `count` headers starting at height 1, so a window big enough to have a body
+     * outside the last-6 tail can be built cheaply. The headers are real: mined
+     * at the regtest limit and linked to the anchor, because HeaderStore.open
+     * re-validates the whole stored window and drops one that does not link.
+     * Roots are `rootFor(height)` so the tests can name them. */
     async function seedWindow(count: number) {
       const fs = memoryHeaderFs()
       const bin = new Uint8Array(count * HEADER_BYTES)
+      let prev = ANCHOR.hash
+      let tipHash = prev
       for (let i = 0; i < count; i++) {
-        const wire = new Uint8Array(Utils.toArray(rootFor(i + 1), 'hex')).slice().reverse()
-        bin.set(wire, i * HEADER_BYTES + 36)
+        const m = mineHeader({ previousHash: prev, height: i + 1, root: rootFor(i + 1) })
+        bin.set(m.bytes, i * HEADER_BYTES)
+        prev = m.hash
+        tipHash = m.hash
       }
-      await fs.writeBytes('ttn.bin', bin)
+      await fs.writeBytes('regtest.bin', bin)
       await fs.writeText(
-        'ttn.json',
-        JSON.stringify({ chain: 'ttn', anchorHeight: 0, anchorHash: ANCHOR.hash, count, tipHash: 'ff'.repeat(32) })
+        'regtest.json',
+        JSON.stringify({ chain: 'regtest', anchorHeight: 0, anchorHash: ANCHOR.hash, count, tipHash })
       )
-      return HeaderStore.open(fs, 'ttn', ANCHOR)
+      return HeaderStore.open(fs, 'regtest', ANCHOR)
     }
 
     it('refuses a body-height mismatch outright, even when a lying remote agrees with the forged root (MITM case)', async () => {

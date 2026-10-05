@@ -1,0 +1,1939 @@
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
+index 48fd575..c8c8292 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
+@@ -163,7 +163,24 @@ const DEFAULT_SETTINGS: WalletSettings = {
+ }
+ import type { AppChain } from '../config'
+ import { DEFAULT_STORAGE_URL, DEFAULT_CHAIN, ADMIN_ORIGINATOR, toWalletChain } from '../config'
+-import { getBackupUrl, getMandalaEndpoints } from '../toolboxConfig'
++import { getBackupUrl, getChainMode, getMandalaEndpoints, getServiceConfig, getSpvOptions } from '../toolboxConfig'
++import { applySpvServices } from '../spv/applySpvServices'
++import { makeSpvEventSourceClass } from '../spv/spvEventSource'
++import { startTipStream, tipStreamUrl } from '../spv/tipStream'
++import { arcadeAuthHeaders } from '../spv/arcadeAuth'
++import { guardZeroConfInternalize } from '../spv/zeroConf'
++import {
++  announceChainTip,
++  applyChainRulesToMonitorHeaders,
++  requestProofCheck,
++  SPV_PROOF_RECHECK_DELAYS_MS,
++  SPV_NEW_HEADER_FAILURE_BACKOFF_MS,
++  SPV_NEW_HEADER_POLL_MS
++} from '../spv/monitorHeaders'
++import { arcadeMerklePathOverride } from '../spv/arcadeMerklePath'
++import { resolveHeaderSetup } from '../spv/headerSetup'
++import { makeRemoteChaintracks } from '../spv/remoteChaintracks'
++import { assertSpvEndpoints } from '../spv/spvMode'
+ import {
+   DEFAULT_AUTO_APPROVE_THRESHOLD,
+   AUTO_APPROVE_COOLDOWN_MS,
+@@ -220,7 +237,7 @@ import { logWithTimestamp } from '../logging'
+ import { recoverMnemonicWallet } from '../mnemonicWallet'
+ import { vaultStore } from '../services/vault/vaultStore'
+ import { guardVaultAccess } from '../services/vault/guard'
+-import { StorageProvider, ChaintracksServiceClient } from '@bsv/wallet-toolbox-mobile'
++import { StorageProvider } from '@bsv/wallet-toolbox-mobile'
+ import { StorageExpoSQLite } from '../storage'
+ import { makeBuildGeneration } from './buildGeneration'
+ import * as SQLite from 'expo-sqlite'
+@@ -275,7 +292,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
+ import { SWEEP_INTERVAL_MS, runSweep, shouldSweepNow, sweptTotal } from '../pay/sweeper'
+ import { formatAmount } from '../amountFormatHelpers'
+ import { useTranslation } from 'react-i18next'
+-import { HEADER_CHECKPOINTS } from '../headers/checkpoints'
+ import { expoHeaderFs } from '../headers/fs'
+ import { HeaderStore } from '../headers/headerStore'
+ import { OfflineFirstChaintracks } from '../headers/OfflineFirstChaintracks'
+@@ -1257,8 +1273,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+         // for root misses and the source for header sync. chaintracksUrlFor is
+         // the single source of truth for these URLs — createServiceOptions
+         // calls the same function, so there is exactly one table to edit.
+-        const remoteChaintracks = new ChaintracksServiceClient(walletChain, chaintracksUrlFor(chain))
+-        const offlineChaintracks = new OfflineFirstChaintracks(remoteChaintracks, getOnline, walletChain)
++        // spv mode: this chain needs an explicit Arcade + chaintracks (never a public
++        // indexer), and the wallet trusts only its own verified header chain.
++        const spvMode = getChainMode() === 'spv'
++        if (spvMode) assertSpvEndpoints(chain, { ...getServiceConfig(chain), arcUrl: arcUrlOverride || getServiceConfig(chain).arcUrl })
++        // Refuse to build an spv wallet whose chain has no difficulty rules, before anything runs.
++        if (spvMode) resolveHeaderSetup(walletChain, getSpvOptions(), 'spv')
++        // spv: the Arcade API key (if the deployment needs one) goes to every Arcade client
++        // below, each only to its own base URL. Public mode is unchanged.
++        const spvArcKey = spvMode ? arcApiTokenOverride || getServiceConfig(chain).arcApiKey || undefined : undefined
++        const remoteChaintracks = makeRemoteChaintracks(walletChain, chaintracksUrlFor(chain), getSpvOptions(), spvArcKey)
++        const offlineChaintracks = new OfflineFirstChaintracks(remoteChaintracks, getOnline, walletChain, {
++          strict: spvMode
++        })
+         offlineChaintracksRef.current = offlineChaintracks
+ 
+         // Passing offlineChaintracks here does two things, and createServices
+@@ -1292,7 +1319,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+         services.postBeefServices.remove('TaalArcBeef')
+         services.postBeefServices.remove('Bitails')
+         services.postBeefServices.remove('WhatsOnChain')
+-        services.postBeefServices.add(createArcadeBroadcastService(serviceOptions.arcUrl!, callbackToken))
++        services.postBeefServices.add(createArcadeBroadcastService(serviceOptions.arcUrl!, callbackToken, spvArcKey))
+         if (chain === 'main' || chain === 'test') {
+           const taalArcUrl = chain === 'main' ? 'https://arc.taal.com' : 'https://arc-test.taal.com'
+           services.postBeefServices.add(createTaalBroadcastService(taalArcUrl, serviceOptions.taalApiKey))
+@@ -1355,7 +1382,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+           getMerklePathSvc.add({ name: 'Bitails', service: bitailsGetMerklePath })
+         }
+ 
++        // spv mode: Arcade is the only provider left, and lookups Arcade cannot
++        // answer return explicit errors. Applied last so it does not depend on
++        // the order the providers above were registered in.
++        if (spvMode) {
++          applySpvServices(services, {
++            ...arcadeMerklePathOverride(getSpvOptions(), serviceOptions.arcUrl!, offlineChaintracks as never, spvArcKey),
++            headers: offlineChaintracks
++          })
++        }
++
+         const wallet = new Wallet(signer, services, undefined, privilegedKeyManager)
++        // spv: an unmined payment is accepted only once Arcade has seen it on the network. Wrapped on
++        // the Wallet itself, so every route in (page bridge, in-app, nearby, token drain) is covered.
++        if (spvMode) {
++          ;(wallet as any).internalizeAction = guardZeroConfInternalize(wallet.internalizeAction.bind(wallet) as any, {
++            arcUrl: serviceOptions.arcUrl!,
++            apiKey: spvArcKey
++          })
++        }
+         // Consumed only by the toolbox storage-boundary hook. The value is set
+         // by trusted host code and compared with WalletClient's originator;
+         // external action fields cannot manufacture this authorization bit.
+@@ -1874,7 +1919,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+           }
+           const monitorOptions = createWalletMonitorOptions(walletChain, storageManager, services, offlineChaintracks)
+           monitorOptions.callbackToken = callbackToken
+-          monitorOptions.EventSourceClass = loadQuietEventSourceClass()
++          // spv: the SSE listener is a separate port from Arcade's API. With no SSE URL the class is
++          // undefined and the task logs "SSE disabled": proofs arrive by polling.
++          monitorOptions.EventSourceClass = spvMode
++            ? makeSpvEventSourceClass(loadQuietEventSourceClass(), serviceOptions.arcUrl!, getSpvOptions().sseUrl)
++            : loadQuietEventSourceClass()
+           monitorOptions.onTransactionStatusChanged = async (_txid: string, _newStatus: string) => {
+             setTxStatusVersion(v => v + 1)
+             // The database moved, so the backup log has something to catch up on.
+@@ -2143,9 +2192,30 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+             }
+           }
+ 
++          // spv: the monitor's own header checks demand mainnet proof of work, which a chain with
++          // other rules (regtest) never meets, so TaskNewHeader would fail on every poll and proofs
++          // would never be sought. Validate under the rules of the wallet's verified chain instead.
++          if (spvMode) {
++            const spvRules = resolveHeaderSetup(walletChain, getSpvOptions(), 'spv')?.rules
++            // Each new-header poll also syncs the header chain, so proofs do not wait for the app
++            // to return to the foreground (see SPV_NEW_HEADER_POLL_MS).
++            if (spvRules) {
++              applyChainRulesToMonitorHeaders(monitor as never, spvRules, async () => {
++                const store = headerStoreRef.current
++                if (!store || offlineChaintracksRef.current !== offlineChaintracks) return
++                if (!(await getOnline())) return
++                const r = await runHeaderSync(store, remoteChaintracks)
++                if (r?.added) logWithTimestamp(F, `Header sync (new-header poll): +${r.added} to ${r.tipHeight}`)
++              })
++            }
++          }
++
+           const newHeaderTask = monitor._tasks.find((t: any) => t.name === 'NewHeader') as any
+           if (newHeaderTask) {
+             configureNewHeaderPolling(newHeaderTask, {
++              ...(spvMode
++                ? { pollIntervalMs: SPV_NEW_HEADER_POLL_MS, failureBackoffMs: SPV_NEW_HEADER_FAILURE_BACKOFF_MS }
++                : {}),
+               onFailure: (error, retryAt) => {
+                 const message = error instanceof Error ? error.message : String(error)
+                 console.warn(
+@@ -2316,11 +2386,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+             // a store) that belongs to a different build.
+             const stillCurrent = () => offlineChaintracksRef.current === offlineChaintracks
+             try {
+-              const anchor = HEADER_CHECKPOINTS[walletChain as 'main' | 'test' | 'ttn']
+-              if (!anchor) return
++              const headerSetup = resolveHeaderSetup(walletChain, getSpvOptions(), spvMode ? 'spv' : 'public')
++              if (!headerSetup) return
+ 
+               const openStart = Date.now()
+-              const store = await HeaderStore.open(expoHeaderFs(), walletChain, anchor)
++              const store = await HeaderStore.open(expoHeaderFs(), walletChain, headerSetup.anchor, headerSetup.rules)
+               logWithTimestamp(F, `HeaderStore.open took ${Date.now() - openStart}ms (${store.count} headers)`)
+               if (!stillCurrent()) return
+               headerStoreRef.current = store
+@@ -2953,6 +3023,53 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+     })
+   }, [walletBuilt, selectedNetwork, runHeaderSync])
+ 
++  // spv: Arcade's chaintracks pushes each new chain tip (spv/tipStream.ts). A frame is only a
++  // trigger: it runs the same header sync as the triggers above, and the monitor is then told
++  // of the new tip at once, so proofs for the new block are sought on its next cycle instead of
++  // a poll or two later. The new-header poll stays as the fallback for a stream that is down.
++  useEffect(() => {
++    if (!walletBuilt || getChainMode() !== 'spv') return
++    let stop: (() => void) | undefined
++    let cancelled = false
++    const rechecks: ReturnType<typeof setTimeout>[] = []
++    const onTip = async () => {
++      const ct = offlineChaintracksRef.current
++      const store = headerStoreRef.current
++      if (!ct || !store) return
++      if (store.chain !== toWalletChain(selectedNetwork)) return
++      const r = await runHeaderSync(store, ct)
++      if (r?.added) logWithTimestamp(F, `Header sync (tip stream): +${r.added} to ${r.tipHeight}`)
++      const monitor = monitorRef.current
++      if (!monitor) return
++      if (await announceChainTip(monitor as never)) {
++        for (const ms of SPV_PROOF_RECHECK_DELAYS_MS) {
++          rechecks.push(setTimeout(() => {
++            if (monitorRef.current === monitor) requestProofCheck(monitor as never)
++          }, ms))
++        }
++      }
++    }
++    ;(async () => {
++      try {
++        const key = (await getArcApiToken(selectedNetwork)) || getServiceConfig(selectedNetwork).arcApiKey || undefined
++        if (cancelled) return
++        stop = startTipStream({
++          EventSource: loadQuietEventSourceClass() as never,
++          url: tipStreamUrl(chaintracksUrlFor(selectedNetwork)),
++          headers: arcadeAuthHeaders(key),
++          onTip: () => void onTip().catch(() => {})
++        })
++      } catch (e: any) {
++        console.warn('[WalletContext] tip stream unavailable:', e?.message)
++      }
++    })()
++    return () => {
++      cancelled = true
++      stop?.()
++      rechecks.forEach(clearTimeout)
++    }
++  }, [walletBuilt, selectedNetwork, runHeaderSync])
++
+   // Feed the drain's and the backup push's online gates, arming an immediate pass on
+   // reconnect. Both are gated on the app's single online signal.
+   useEffect(() => {
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts b/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts
+index da96849..52f7788 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts
+@@ -31,6 +31,17 @@ function rootHex(v: unknown): string {
+ /** Handed out when the remote cannot subscribe; never reaches the remote. */
+ const INERT_SUBSCRIPTION_PREFIX = 'offline-first:inert:'
+ 
++/**
++ * `strict`: the wallet trusts ONLY its own verified header chain (HeaderStore).
++ * No root, header, height or tip is ever taken from the remote, and a height the
++ * window does not hold is a refusal (an error for header/height lookups, a miss
++ * for root checks), never a network answer. The remote still serves the bytes
++ * the sync validates; it is no longer an authority. See docs/bsv-browser-spv.md.
++ */
++export interface OfflineFirstOptions {
++  strict?: boolean
++}
++
+ export class OfflineFirstChaintracks implements ChaintracksClientApi {
+   private store: HeaderStore | undefined
+   /**
+@@ -49,7 +60,8 @@ export class OfflineFirstChaintracks implements ChaintracksClientApi {
+   constructor(
+     private readonly remote: ChaintracksClientApi,
+     private readonly online: () => Promise<boolean>,
+-    private readonly chain?: Chain
++    private readonly chain?: Chain,
++    private readonly options: OfflineFirstOptions = {}
+   ) {}
+ 
+   /** Consume the most recent unresolved height, if any. Kept for tests; classifiers must peek. */
+@@ -68,7 +80,23 @@ export class OfflineFirstChaintracks implements ChaintracksClientApi {
+     this.store = store
+   }
+ 
++  private requireStore(what: string): HeaderStore {
++    if (!this.store) throw new Error(`${what}: no verified header chain is available yet`)
++    return this.store
++  }
++
+   async isValidRootForHeight(root: string, height: number): Promise<boolean> {
++    if (this.options.strict) {
++      // Only the verified window; never the `extra` cache, never the network.
++      const verified = this.store?.verifiedRootForHeight(height)
++      if (verified !== undefined) return verified === root
++      console.warn(
++        `[OfflineFirstChaintracks] REFUSED height ${height}: not in the verified header chain ` +
++          `(tip ${this.store?.tipHeight ?? 'none'}); strict mode does not ask the network.`
++      )
++      this.lastMissHeight = height
++      return false
++    }
+     // Fast path: a local root that AGREES is trusted offline forever (validated
+     // window headers, or a previously-resolved root).
+     const local = this.store?.rootForHeight(height)
+@@ -174,6 +202,7 @@ export class OfflineFirstChaintracks implements ChaintracksClientApi {
+   }
+ 
+   async currentHeight(): Promise<number> {
++    if (this.options.strict) return this.requireStore('currentHeight').tipHeight
+     if (await this.online()) return await this.remote.currentHeight()
+     return this.store?.tipHeight ?? 0
+   }
+@@ -228,16 +257,35 @@ export class OfflineFirstChaintracks implements ChaintracksClientApi {
+   getHeaders(height: number, count: number) {
+     return this.remote.getHeaders(height, count)
+   }
+-  findChainTipHeader() {
++  async findChainTipHeader() {
++    if (this.options.strict) {
++      const store = this.requireStore('findChainTipHeader')
++      const tip = await store.headerForHeight(store.tipHeight)
++      if (!tip) throw new Error('the verified header chain has no header yet')
++      return tip
++    }
+     return this.remote.findChainTipHeader()
+   }
+-  findChainTipHash() {
++  async findChainTipHash() {
++    if (this.options.strict) return this.requireStore('findChainTipHash').tipHash
+     return this.remote.findChainTipHash()
+   }
+-  findHeaderForHeight(height: number) {
++  async findHeaderForHeight(height: number) {
++    if (this.options.strict) {
++      const header = await this.requireStore('findHeaderForHeight').headerForHeight(height)
++      if (!header) {
++        throw new Error(`height ${height} is not in the verified header chain (tip ${this.store!.tipHeight})`)
++      }
++      return header
++    }
+     return this.remote.findHeaderForHeight(height)
+   }
+-  findHeaderForBlockHash(hash: string) {
++  async findHeaderForBlockHash(hash: string) {
++    if (this.options.strict) {
++      const store = this.requireStore('findHeaderForBlockHash')
++      const height = store.heightForHash(hash)
++      return height === undefined ? undefined : await store.headerForHeight(height)
++    }
+     return this.remote.findHeaderForBlockHash(hash)
+   }
+   addHeader(header: Parameters<ChaintracksClientApi['addHeader']>[0]) {
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/headers/chainRules.ts b/node_modules/@bsv/expo-wallet-toolbox/core/headers/chainRules.ts
+new file mode 100644
+index 0000000..e57359d
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/headers/chainRules.ts
+@@ -0,0 +1,94 @@
++/**
++ * Per-chain header acceptance rules, kept apart from `HeaderStore` so the
++ * network-specific part lives in one place and can be tested on its own.
++ *
++ * `HeaderStore` validates linkage itself. What counts as an acceptable
++ * difficulty is the chain's business, and is decided here:
++ *
++ *  · `defaultRules` is the toolbox's own check (`validateHeaderProofOfWork`):
++ *    hash meets the header's declared target and that target is within the
++ *    mainnet proof-of-work limit. It does NOT enforce retargeting, median-time
++ *    or most-work, and says so by name. Used for main / test / ttn exactly as
++ *    before.
++ *  · `regtestRules` is a chain with no retargeting and a fixed limit
++ *    (0x207fffff): every header must declare exactly that, and meet it.
++ *    Without this a regtest chain cannot pass the mainnet limit at all.
++ *
++ * Mainnet and testnet retarget/DAA rules are NOT implemented yet. They need
++ * headers from before the checkpoint window, so they are a separate piece of
++ * work (see docs/bsv-browser-spv.md); this module is where they will go.
++ */
++import { utils as chaintracksUtils } from '@bsv/wallet-toolbox-mobile'
++
++const { validateHeaderProofOfWork } = chaintracksUtils
++
++export interface HeaderForRules {
++  height: number
++  /** Display-order hex block hash, recomputed by the caller (never taken from a source). */
++  hash: string
++  bits: number
++  time: number
++}
++
++export interface PreviousForRules {
++  bits: number
++  time: number
++}
++
++export interface HeaderRules {
++  readonly name: string
++  /** Throws when the header violates the chain's difficulty rules. `prev` is absent for the first header of a window. */
++  validate(header: HeaderForRules, prev?: PreviousForRules): void
++  /** Work represented by a header declaring `bits`. */
++  workForBits(bits: number): bigint
++}
++
++/** Expand compact `bits` to a target; throws on a malformed encoding. */
++export function targetFromBits(bits: number): bigint {
++  if (!Number.isSafeInteger(bits) || bits < 0 || bits > 0xffffffff) throw new Error('Block target encoding is invalid.')
++  const size = bits >>> 24
++  const word = bits & 0x7fffff
++  const negative = word !== 0 && (bits & 0x800000) !== 0
++  if (word === 0 || negative || size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32)) {
++    throw new Error('Block target encoding is invalid.')
++  }
++  return size <= 3 ? BigInt(word) >> BigInt(8 * (3 - size)) : BigInt(word) << BigInt(8 * (size - 3))
++}
++
++/** Expected hashes needed to find a header at `bits`: floor(2^256 / (target + 1)), as Bitcoin counts it. */
++export function workFromBits(bits: number): bigint {
++  const target = targetFromBits(bits)
++  return (BigInt(1) << BigInt(256)) / (target + BigInt(1))
++}
++
++const meetsTarget = (hash: string, bits: number): boolean => BigInt('0x' + hash) <= targetFromBits(bits)
++
++export const defaultRules: HeaderRules = {
++  name: 'default',
++  validate(h) {
++    validateHeaderProofOfWork({ bits: h.bits, hash: h.hash, height: h.height, time: h.time } as any)
++  },
++  workForBits: workFromBits
++}
++
++export const REGTEST_POW_LIMIT_BITS = 0x207fffff
++
++export const regtestRules: HeaderRules = {
++  name: 'regtest',
++  validate(h) {
++    if (h.bits !== REGTEST_POW_LIMIT_BITS) {
++      throw new Error(
++        `header at height ${h.height} declares bits 0x${h.bits.toString(16)}; regtest has no difficulty adjustment, ` +
++          `bits must be 0x${REGTEST_POW_LIMIT_BITS.toString(16)} (proof-of-work limit)`
++      )
++    }
++    if (!meetsTarget(h.hash, h.bits)) {
++      throw new Error(`header at height ${h.height} does not meet its declared target`)
++    }
++  },
++  workForBits: workFromBits
++}
++
++export function rulesForChain(chain: string): HeaderRules {
++  return chain === 'regtest' ? regtestRules : defaultRules
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/headers/headerStore.ts b/node_modules/@bsv/expo-wallet-toolbox/core/headers/headerStore.ts
+index ed823c9..d04cb97 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/headers/headerStore.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/headers/headerStore.ts
+@@ -23,8 +23,9 @@ import { Utils } from '@bsv/sdk'
+ import { utils as chaintracksUtils } from '@bsv/wallet-toolbox-mobile'
+ import type { HeaderCheckpoint } from './checkpoints'
+ import type { HeaderFs } from './fs'
++import { rulesForChain, type HeaderRules } from './chainRules'
+ 
+-const { blockHash, deserializeBaseBlockHeader, validateHeaderProofOfWork } = chaintracksUtils
++const { blockHash, deserializeBaseBlockHeader } = chaintracksUtils
+ 
+ const HEADER_BYTES = 80
+ const ROOT_BYTES = 32
+@@ -43,6 +44,12 @@ export class HeaderStore {
+   yieldEvery = HeaderStore.DEFAULT_YIELD_EVERY
+ 
+   private roots: Uint8Array
++  /** Block hashes (display order), packed 32 bytes per stored header. */
++  private hashes: Uint8Array
++  /** `bits` of each stored header, in window order. */
++  private bitsList: number[]
++  /** `time` of the last stored header (rules that look at timestamps need it). */
++  private lastTime = 0
+   private extra: Record<string, string>
+   private constructor(
+     private readonly fs: HeaderFs,
+@@ -51,10 +58,15 @@ export class HeaderStore {
+     private headerCount: number,
+     private currentTipHash: string,
+     roots: Uint8Array,
+-    extra: Record<string, string>
++    extra: Record<string, string>,
++    readonly rules: HeaderRules,
++    hashes: Uint8Array = new Uint8Array(0),
++    bitsList: number[] = []
+   ) {
+     this.roots = roots
+     this.extra = extra
++    this.hashes = hashes
++    this.bitsList = bitsList
+   }
+ 
+   private get binPath(): string {
+@@ -83,7 +95,12 @@ export class HeaderStore {
+     return this.currentTipHash
+   }
+ 
+-  static async open(fs: HeaderFs, chain: string, anchor: HeaderCheckpoint): Promise<HeaderStore> {
++  static async open(
++    fs: HeaderFs,
++    chain: string,
++    anchor: HeaderCheckpoint,
++    rules: HeaderRules = rulesForChain(chain)
++  ): Promise<HeaderStore> {
+     const extraRaw = await fs.readText(`${chain}-extra.json`)
+     let extra: Record<string, string> = {}
+     if (extraRaw) {
+@@ -105,7 +122,7 @@ export class HeaderStore {
+       }
+     }
+ 
+-    const empty = new HeaderStore(fs, chain, anchor, 0, anchor.hash, new Uint8Array(0), extra)
++    const empty = new HeaderStore(fs, chain, anchor, 0, anchor.hash, new Uint8Array(0), extra, rules)
+ 
+     // A shipped checkpoint that moved (app update) invalidates the window: its
+     // first header no longer links to anything we trust. Start over rather than
+@@ -134,15 +151,94 @@ export class HeaderStore {
+       await fs.writeBytes(`${chain}.bin`, bin)
+     }
+ 
++    // Re-validate the whole stored window against the chain's rules instead of
++    // trusting the file: linkage from the anchor, each hash recomputed, the
++    // rules applied. A window that fails anywhere is dropped, never partly
++    // kept, and re-synced from the checkpoint.
+     const roots = new Uint8Array(meta.count * ROOT_BYTES)
++    const hashes = new Uint8Array(meta.count * ROOT_BYTES)
++    const bitsList: number[] = []
++    let prevHash = anchor.hash
++    let prev: { bits: number; time: number } | undefined
+     for (let i = 0; i < meta.count; i++) {
++      if (i > 0 && i % empty.yieldEvery === 0) await yieldToEventLoop()
++      const offset = i * HEADER_BYTES
++      const parsed = deserializeBaseBlockHeader(bin, offset)
++      const hash = blockHash(bin.subarray(offset, offset + HEADER_BYTES))
++      try {
++        if (parsed.previousHash !== prevHash) throw new Error('link')
++        rules.validate({ height: anchor.height + 1 + i, hash, bits: parsed.bits, time: parsed.time }, prev)
++      } catch {
++        await empty.reset()
++        return empty
++      }
+       // Merkle root occupies bytes 36..68 of a header, little-endian on the
+       // wire and display order reversed.
+-      const src = bin.subarray(i * HEADER_BYTES + 36, i * HEADER_BYTES + 68)
+-      const display = src.slice().reverse()
+-      roots.set(display, i * ROOT_BYTES)
++      const src = bin.subarray(offset + 36, offset + 68)
++      roots.set(src.slice().reverse(), i * ROOT_BYTES)
++      hashes.set(Uint8Array.from(Utils.toArray(hash, 'hex')), i * ROOT_BYTES)
++      bitsList.push(parsed.bits)
++      prevHash = hash
++      prev = { bits: parsed.bits, time: parsed.time }
++    }
++    if (prevHash !== meta.tipHash) {
++      await empty.reset()
++      return empty
++    }
++    const store = new HeaderStore(fs, chain, anchor, meta.count, meta.tipHash, roots, extra, rules, hashes, bitsList)
++    store.lastTime = prev!.time
++    return store
++  }
++
++  /** Display-order hash of the stored header at `height`, or the anchor hash at the anchor height. */
++  hashForHeight(height: number): string | undefined {
++    if (height === this.anchor.height) return this.anchor.hash
++    const index = height - this.baseHeight
++    if (index < 0 || index >= this.headerCount) return undefined
++    return Utils.toHex(Array.from(this.hashes.subarray(index * ROOT_BYTES, (index + 1) * ROOT_BYTES)))
++  }
++
++  /**
++   * The root of a stored header, from the window ONLY. Unlike `rootForHeight`
++   * it never consults the `extra` cache, whose entries are answers a remote
++   * once gave and nothing has verified. This is the root strict mode trusts.
++   */
++  verifiedRootForHeight(height: number): string | undefined {
++    const index = height - this.baseHeight
++    if (index < 0 || index >= this.headerCount) return undefined
++    return Utils.toHex(Array.from(this.roots.subarray(index * ROOT_BYTES, (index + 1) * ROOT_BYTES)))
++  }
++
++  /** Height of the stored header with this display-order hash, if the window holds it. */
++  heightForHash(hash: string): number | undefined {
++    for (let i = this.headerCount - 1; i >= 0; i--) {
++      if (Utils.toHex(Array.from(this.hashes.subarray(i * ROOT_BYTES, (i + 1) * ROOT_BYTES))) === hash) {
++        return this.baseHeight + i
++      }
+     }
+-    return new HeaderStore(fs, chain, anchor, meta.count, meta.tipHash, roots, extra)
++    return undefined
++  }
++
++  /** The full stored header at `height`, or undefined outside the window. Reads the .bin. */
++  async headerForHeight(height: number): Promise<
++    { version: number; previousHash: string; merkleRoot: string; time: number; bits: number; nonce: number; height: number; hash: string } | undefined
++  > {
++    const index = height - this.baseHeight
++    if (index < 0 || index >= this.headerCount) return undefined
++    const bin = await this.fs.readBytes(this.binPath)
++    if (!bin || bin.length < (index + 1) * HEADER_BYTES) return undefined
++    const bytes = bin.subarray(index * HEADER_BYTES, (index + 1) * HEADER_BYTES)
++    const parsed = deserializeBaseBlockHeader(bytes, 0)
++    return { ...parsed, height, hash: blockHash(bytes) }
++  }
++
++  /** Total work of stored headers in `[from, to]` (inclusive); 0 for an empty or out-of-window range. */
++  workBetween(from: number, to: number): bigint {
++    let total = BigInt(0)
++    const lo = Math.max(from, this.baseHeight)
++    const hi = Math.min(to, this.tipHeight)
++    for (let h = lo; h <= hi; h++) total += this.rules.workForBits(this.bitsList[h - this.baseHeight])
++    return total
+   }
+ 
+   rootForHeight(height: number): string | undefined {
+@@ -197,7 +293,13 @@ export class HeaderStore {
+ 
+     const added = bytes.length / HEADER_BYTES
+     const newRoots = new Uint8Array(added * ROOT_BYTES)
++    const newHashes = new Uint8Array(added * ROOT_BYTES)
++    const newBits: number[] = []
+     let prev = this.currentTipHash
++    let prevHeader: { bits: number; time: number } | undefined =
++      this.headerCount > 0
++        ? { bits: this.bitsList[this.headerCount - 1], time: this.lastTime }
++        : undefined
+ 
+     for (let i = 0; i < added; i++) {
+       // Two SHA-256 passes and a difficulty check per header, on the JS thread.
+@@ -214,12 +316,15 @@ export class HeaderStore {
+         )
+       }
+       const hash = blockHash(header)
+-      // Throws on failure — a header that does not meet its own target is not a
+-      // header, and accepting it would let anyone mint merkle roots. Takes the
+-      // display-order hex hash blockHash returns, validates the compact target
+-      // encoding, and honours the toolbox's consensus proof-of-work exceptions.
+-      validateHeaderProofOfWork({ ...parsed, height: firstHeight + i, hash })
++      // Throws on failure — a header that does not meet the chain's difficulty
++      // rules is not a header, and accepting it would let anyone mint merkle
++      // roots. The rules are the chain's (see chainRules.ts): for main/test/ttn
++      // the toolbox's proof-of-work check, for regtest a fixed limit.
++      this.rules.validate({ height: firstHeight + i, hash, bits: parsed.bits, time: parsed.time }, prevHeader)
+       newRoots.set(new Uint8Array(Utils.toArray(parsed.merkleRoot, 'hex')), i * ROOT_BYTES)
++      newHashes.set(Uint8Array.from(Utils.toArray(hash, 'hex')), i * ROOT_BYTES)
++      newBits.push(parsed.bits)
++      prevHeader = { bits: parsed.bits, time: parsed.time }
+       prev = hash
+     }
+ 
+@@ -228,6 +333,12 @@ export class HeaderStore {
+     merged.set(this.roots, 0)
+     merged.set(newRoots, this.roots.length)
+     this.roots = merged
++    const mergedHashes = new Uint8Array(this.hashes.length + newHashes.length)
++    mergedHashes.set(this.hashes, 0)
++    mergedHashes.set(newHashes, this.hashes.length)
++    this.hashes = mergedHashes
++    this.bitsList = this.bitsList.concat(newBits)
++    this.lastTime = prevHeader!.time
+     this.headerCount += added
+     this.currentTipHash = prev
+     await this.writeMeta()
+@@ -256,6 +367,9 @@ export class HeaderStore {
+     const sliced = bin.subarray(0, keep)
+     await this.fs.writeBytes(this.binPath, sliced)
+     this.roots = new Uint8Array(this.roots.subarray(0, count * ROOT_BYTES))
++    this.hashes = new Uint8Array(this.hashes.subarray(0, count * ROOT_BYTES))
++    this.bitsList = this.bitsList.slice(0, count)
++    this.lastTime = deserializeBaseBlockHeader(sliced, keep - HEADER_BYTES).time
+     this.headerCount = count
+     this.currentTipHash = blockHash(sliced.subarray(keep - HEADER_BYTES, keep))
+     await this.writeMeta()
+@@ -324,6 +438,9 @@ export class HeaderStore {
+   async reset(): Promise<void> {
+     await this.fs.deleteFile(this.binPath)
+     this.roots = new Uint8Array(0)
++    this.hashes = new Uint8Array(0)
++    this.bitsList = []
++    this.lastTime = 0
+     this.headerCount = 0
+     this.currentTipHash = this.anchor.hash
+     await this.writeMeta()
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/headers/syncHeaders.ts b/node_modules/@bsv/expo-wallet-toolbox/core/headers/syncHeaders.ts
+index 40807f0..bd7943d 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/headers/syncHeaders.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/headers/syncHeaders.ts
+@@ -8,22 +8,39 @@
+  * The default chunk of 2,000 headers is 320 KB of response body: about 26
+  * requests per year of mainnet headers, small enough that a dropped connection
+  * costs almost nothing and progress moves visibly.
++ *
++ * REORGS. When the remote's next header does not link to our tip, the remote is
++ * on another branch. We do not follow it blindly: we find the fork point, fetch
++ * the whole competing branch into a scratch store that applies the same chain
++ * rules, and switch only if it carries strictly MORE work than the headers it
++ * would replace and is no deeper than `maxReorgDepth`. Otherwise the store is
++ * left exactly as it was and the reason is reported in the result.
+  */
+ import { Utils } from '@bsv/sdk'
+-import type { HeaderStore } from './headerStore'
++import { utils as chaintracksUtils } from '@bsv/wallet-toolbox-mobile'
++import { HeaderStore } from './headerStore'
++import { memoryHeaderFs } from './fs'
++
++const { blockHash } = chaintracksUtils
+ 
+ export interface HeaderSource {
+   getHeaders(height: number, count: number): Promise<string>
+   getPresentHeight(): Promise<number>
+ }
+ 
++export type RejectedFork = 'too-deep' | 'less-work' | 'invalid'
++
+ export interface SyncHeadersResult {
+   added: number
+   tipHeight: number
+   presentHeight: number
++  /** Set when the window followed a heavier competing branch: how many stored headers it replaced. */
++  reorgDepth?: number
++  /** Set when a competing branch was seen and refused; the store was not changed. */
++  rejectedFork?: RejectedFork
+ }
+ 
+-/** Walk back at most this many headers before giving up and resetting. */
++/** Deepest reorg followed by default. Deeper than this is refused, not reset. */
+ const REWIND_CAP = 144
+ 
+ /** Bytes in one serialized block header. */
+@@ -34,17 +51,98 @@ function isFirstHeaderPrevHashError(err: unknown, firstHeight: number): boolean
+   return /previous hash/i.test(msg) && msg.includes(`header at height ${firstHeight} `)
+ }
+ 
++const hexToBytes = (hex: string): Uint8Array => new Uint8Array(Utils.toArray(hex, 'hex'))
++
++/**
++ * Highest height at which the remote chain and our window agree, searching at
++ * most `maxDepth` stored headers back from our tip. Undefined when none agree
++ * within that span.
++ */
++async function findForkPoint(store: HeaderStore, client: HeaderSource, maxDepth: number): Promise<number | undefined> {
++  const lowest = Math.max(store.baseHeight, store.tipHeight - maxDepth + 1)
++  const count = store.tipHeight - lowest + 1
++  const hex = await client.getHeaders(lowest, count)
++  const bytes = hex ? hexToBytes(hex) : new Uint8Array(0)
++  const have = Math.min(Math.floor(bytes.length / HEADER_BYTES), count)
++  let fork: number | undefined
++  for (let i = 0; i < have; i++) {
++    const hash = blockHash(bytes.subarray(i * HEADER_BYTES, (i + 1) * HEADER_BYTES))
++    if (hash !== store.hashForHeight(lowest + i)) break
++    fork = lowest + i
++  }
++  if (fork !== undefined) return fork
++  // Nothing in the searched span agrees. If the span reached the bottom of the
++  // window, the fork is at the anchor, which the remote must still contain
++  // (the scratch store links its first header to it). Otherwise it is too deep.
++  return lowest === store.baseHeight ? store.anchor.height : undefined
++}
++
++type ForkOutcome = { kind: 'switched'; depth: number; added: number } | { kind: RejectedFork }
++
++async function followFork(
++  store: HeaderStore,
++  client: HeaderSource,
++  presentHeight: number,
++  chunkSize: number,
++  maxReorgDepth: number
++): Promise<ForkOutcome> {
++  const fork = await findForkPoint(store, client, maxReorgDepth)
++  if (fork === undefined) return { kind: 'too-deep' }
++  const depth = store.tipHeight - fork
++
++  // Build the competing branch in a scratch store with the SAME rules. Nothing
++  // touches the real window until the branch has validated and out-weighed ours.
++  const scratch = await HeaderStore.open(
++    memoryHeaderFs(),
++    `${store.chain}-scratch`,
++    { height: fork, hash: store.hashForHeight(fork)! },
++    store.rules
++  )
++  const chunks: Uint8Array[] = []
++  try {
++    while (scratch.tipHeight < presentHeight) {
++      const from = scratch.tipHeight + 1
++      const want = Math.min(chunkSize, presentHeight - scratch.tipHeight)
++      const hex = await client.getHeaders(from, want)
++      if (!hex) break
++      let bytes = hexToBytes(hex)
++      if (bytes.length === 0) break
++      if (bytes.length > want * HEADER_BYTES) bytes = bytes.subarray(0, want * HEADER_BYTES)
++      await scratch.append(bytes, from)
++      chunks.push(bytes)
++    }
++  } catch {
++    return { kind: 'invalid' }
++  }
++
++  const theirs = scratch.workBetween(fork + 1, scratch.tipHeight)
++  const ours = store.workBetween(fork + 1, store.tipHeight)
++  if (theirs <= ours) return { kind: 'less-work' }
++
++  await store.truncateToCount(fork - store.anchor.height)
++  let added = 0
++  let h = fork + 1
++  for (const bytes of chunks) {
++    added += await store.append(bytes, h)
++    h += bytes.length / HEADER_BYTES
++  }
++  return { kind: 'switched', depth, added }
++}
++
+ export async function syncHeaders(args: {
+   store: HeaderStore
+   client: HeaderSource
+   chunkSize?: number
++  /** Deepest reorg to follow. Defaults to 144. */
++  maxReorgDepth?: number
+   onProgress?: (tipHeight: number, presentHeight: number) => void
+   shouldStop?: () => boolean
+ }): Promise<SyncHeadersResult> {
+-  const { store, client, chunkSize = 2000, onProgress, shouldStop } = args
++  const { store, client, chunkSize = 2000, maxReorgDepth = REWIND_CAP, onProgress, shouldStop } = args
+   const presentHeight = await client.getPresentHeight()
+   let added = 0
+-  let rewinds = 0
++  let reorgDepth: number | undefined
++  let rejectedFork: RejectedFork | undefined
+ 
+   while (store.tipHeight < presentHeight) {
+     if (shouldStop?.()) break
+@@ -52,7 +150,7 @@ export async function syncHeaders(args: {
+     const want = Math.min(chunkSize, presentHeight - store.tipHeight)
+     const hex = await client.getHeaders(from, want)
+     if (!hex) break
+-    let bytes = new Uint8Array(Utils.toArray(hex, 'hex'))
++    let bytes = hexToBytes(hex)
+     if (bytes.length === 0) break
+     // XR-060: each header still has to pass real PoW and chain-linkage
+     // validation below, so a compromised/misbehaving chaintracks endpoint
+@@ -66,19 +164,20 @@ export async function syncHeaders(args: {
+       added += await store.append(bytes, from)
+       onProgress?.(store.tipHeight, presentHeight)
+     } catch (err) {
+-      // First-header previous-hash miss is a tip reorg: drop the orphan and
+-      // refetch. A later header in the chunk, or any other validation failure,
++      // Only a first-header previous-hash miss means "the remote is on another
++      // branch". A later header in the chunk, or any other validation failure,
+       // still propagates — a silent truncated window would look complete.
+-      if (!isFirstHeaderPrevHashError(err, from)) throw err
+-      if (store.count > 0 && rewinds < REWIND_CAP) {
+-        await store.truncateToCount(store.count - 1)
+-        rewinds++
+-        continue
++      if (!isFirstHeaderPrevHashError(err, from) || store.count === 0) throw err
++      const outcome = await followFork(store, client, presentHeight, chunkSize, maxReorgDepth)
++      if (outcome.kind !== 'switched') {
++        rejectedFork = outcome.kind
++        break
+       }
+-      await store.reset()
+-      throw err
++      added += outcome.added
++      reorgDepth = outcome.depth
++      onProgress?.(store.tipHeight, presentHeight)
+     }
+   }
+ 
+-  return { added, tipHeight: store.tipHeight, presentHeight }
++  return { added, tipHeight: store.tipHeight, presentHeight, reorgDepth, rejectedFork }
+ }
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts b/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
+index c227bba..76e6a32 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/services/arcadeBroadcastProvider.ts
+@@ -1,5 +1,6 @@
+ import { Beef, Transaction, Utils } from '@bsv/sdk'
+ import type { PostBeefResult, PostTxResultForTxid } from '../toolboxTypes'
++import { arcadeAuthHeaders } from '../spv/arcadeAuth'
+ 
+ const BROADCAST_TIMEOUT_MS = 30_000
+ 
+@@ -289,10 +290,11 @@ function createArcBroadcastService(
+ /**
+  * Arcade broadcast service — EF format with callback token for SSE updates.
+  */
+-export function createArcadeBroadcastService(arcadeUrl: string, callbackToken: string) {
++export function createArcadeBroadcastService(arcadeUrl: string, callbackToken: string, apiKey?: string | null) {
+   return createArcBroadcastService('Arcade', arcadeUrl, '/tx', {
+     'X-CallbackToken': callbackToken,
+-    'X-FullStatusUpdates': 'true'
++    'X-FullStatusUpdates': 'true',
++    ...arcadeAuthHeaders(apiKey)
+   })
+ }
+ 
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts
+new file mode 100644
+index 0000000..f0c36f4
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/applySpvServices.ts
+@@ -0,0 +1,105 @@
++/**
++ * Narrows a `Services` instance to Arcade only, for spv chain mode.
++ *
++ * Runs AFTER the host has registered whatever providers it likes (WalletContext
++ * adds Taal, GorillaPool, WhatsOnChain and Bitails to the broadcast chain and
++ * swaps in a WhatsOnChain BUMP provider), so the result does not depend on the
++ * order those were added in.
++ *
++ *  · Proofs, tx status and broadcast keep only the Arcade providers.
++ *  · Raw-tx, UTXO and address-history lookups have no Arcade equivalent (Arcade
++ *    has no raw-tx, UTXO, address or outspend endpoint). They are replaced by a
++ *    provider that answers with an explicit ERROR. An empty collection would
++ *    throw an incidental TypeError, and an empty result would read as "nothing
++ *    there"; neither is acceptable for a lookup that was blocked on purpose.
++ *    Outputs and parent transactions arrive inside BEEFs instead.
++ */
++import type { Services } from '@bsv/wallet-toolbox-mobile'
++
++interface Entry {
++  name: string
++  service: (...args: any[]) => Promise<any>
++}
++interface Collection {
++  services: Entry[]
++  _index: number
++}
++
++const isArcade = (e: Entry): boolean => /^arcade/i.test(e.name)
++
++const NO_INDEXER = 'SpvNoIndexer'
++const message = (what: string): string =>
++  `spv mode: ${what} is not available. Arcade has no such endpoint; outputs and parent transactions arrive in BEEFs.`
++
++function keepArcadeOnly(c: Collection): void {
++  c.services = c.services.filter(isArcade)
++  c._index = 0
++}
++
++function replaceWithError(
++  c: Collection,
++  make: (err: Error, firstArg: unknown) => Record<string, unknown>,
++  what: string
++): void {
++  c.services = [
++    {
++      name: NO_INDEXER,
++      service: async (firstArg?: unknown) => make(new Error(message(what)), firstArg)
++    }
++  ]
++  c._index = 0
++}
++
++export interface SpvServiceOptions {
++  /** Replaces the Arcade `getMerklePath` provider (see arcadeMerklePath.ts) for chains the toolbox's own cannot read. */
++  merklePath?: (txid: string) => Promise<any>
++  /**
++   * The wallet's verified header chain. When given, `hashToHeader` (which the toolbox's Arcade
++   * proof path uses to canonicalise a proof's header) answers from it instead of asking the
++   * remote chaintracks and checking only proof-of-work against the mainnet limit.
++   */
++  headers?: { findHeaderForBlockHash(hash: string): Promise<any> }
++}
++
++export function applySpvServices(services: Services, options: SpvServiceOptions = {}): void {
++  const s = services as unknown as Record<string, Collection>
++
++  // The toolbox SSE client accepts an absent API key but rejects an empty one, and
++  // createServiceOptions produces '' when there is no key.
++  const arcadeConfig = (services as any).options?.arcadeConfig
++  if (arcadeConfig && !arcadeConfig.apiKey) arcadeConfig.apiKey = undefined
++
++  keepArcadeOnly(s.getMerklePathServices)
++  if (options.headers) {
++    const headers = options.headers
++    ;(services as any).hashToHeader = async (hash: string) => {
++      const header = await headers.findHeaderForBlockHash(String(hash).toLowerCase())
++      if (!header) throw new Error(`block ${hash} is not in the verified header chain`)
++      return header
++    }
++  }
++  if (options.merklePath) {
++    for (const e of s.getMerklePathServices.services) e.service = options.merklePath
++  }
++  keepArcadeOnly(s.getStatusForTxidsServices)
++  keepArcadeOnly(s.postBeefServices)
++  if (s.getMerklePathServices.services.length === 0 || s.postBeefServices.services.length === 0) {
++    throw new Error('spv mode needs an Arcade provider for proofs and broadcast, but none is configured (is the Arcade URL set?)')
++  }
++
++  replaceWithError(
++    s.getRawTxServices,
++    (error, txid) => ({ txid, name: NO_INDEXER, error }),
++    'raw transaction lookup'
++  )
++  replaceWithError(
++    s.getUtxoStatusServices,
++    error => ({ name: NO_INDEXER, status: 'error', error, details: [] }),
++    'UTXO status lookup'
++  )
++  replaceWithError(
++    s.getScriptHashHistoryServices,
++    error => ({ name: NO_INDEXER, status: 'error', error, history: [] }),
++    'address history lookup'
++  )
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts
+new file mode 100644
+index 0000000..836d298
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeAuth.ts
+@@ -0,0 +1,19 @@
++/**
++ * The Authorization header for an Arcade deployment that requires an API key.
++ * Same scheme the toolbox's own Arcade and SSE clients use (`Bearer <key>`).
++ *
++ * Every spv Arcade client takes the key at construction and sends it only to its
++ * own base URL, and `assertSpvEndpoints` has already required https (or a
++ * local-development host) for that URL. A key that could split or bloat a header
++ * is refused, and is never put in an error message.
++ */
++const MAX_KEY = 4096
++
++export function arcadeAuthHeaders(apiKey: string | null | undefined): Record<string, string> {
++  const key = (apiKey ?? '').trim()
++  if (key === '') return {}
++  if (key.length > MAX_KEY || /[\u0000-\u001f\u007f]/.test(key)) {
++    throw new Error('Arcade API key is not valid for an HTTP header')
++  }
++  return { Authorization: `Bearer ${key}` }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts
+new file mode 100644
+index 0000000..d1a048f
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/arcadeMerklePath.ts
+@@ -0,0 +1,78 @@
++/**
++ * A `getMerklePath` service for spv mode: the BUMP Arcade reports for a mined
++ * transaction, paired with the header from the wallet's OWN verified chain.
++ *
++ * Why not the toolbox's built-in Arcade provider: it also validates the header's
++ * proof-of-work against the mainnet limit, so it refuses every proof on a chain
++ * with other rules (regtest). It also takes the header from wherever the services
++ * point; here the header is the verified one by construction.
++ *
++ * What this does NOT do is vouch for the proof. The toolbox authenticates it
++ * before storing (`EntityProvenTx.fromReq` -> `isValidRootForHeight` on the chain
++ * tracker), and in spv mode that tracker is the strict, verified-chain-only one.
++ * A proof whose height the verified chain does not hold yet comes back as an
++ * ERROR with no merklePath, so the request stays pending and is retried after the
++ * next header sync, and is never stored unverified.
++ */
++import { MerklePath } from '@bsv/sdk'
++import { arcadeAuthHeaders } from './arcadeAuth'
++
++type Header = { height: number; hash: string; merkleRoot: string } & Record<string, unknown>
++
++export interface MerklePathServiceResult {
++  name: string
++  merklePath?: MerklePath
++  header?: Header
++  error?: Error
++  notes?: { what: string; [k: string]: unknown }[]
++}
++
++export function createArcadeMerklePathService(
++  arcUrl: string,
++  getVerifiedHeader: (height: number) => Promise<Header | undefined>,
++  fetcher: typeof fetch = (...a) => fetch(...a),
++  apiKey?: string | null
++): (txid: string) => Promise<MerklePathServiceResult> {
++  const base = arcUrl.replace(/\/+$/, '')
++  const headers = arcadeAuthHeaders(apiKey)
++  return async txid => {
++    if (!/^[0-9a-fA-F]{64}$/.test(txid)) throw new Error('getMerklePath: txid must be 64 hex characters')
++    const name = 'Arcade'
++    const note = (what: string, extra: Record<string, unknown> = {}) => [{ what, when: new Date().toISOString(), ...extra }]
++    const res = await fetcher(`${base}/tx/${txid.toLowerCase()}`, { headers })
++    if (res.status === 404) return { name, notes: note('getMerklePathNoData') }
++    if (!res.ok) return { name, notes: note('getMerklePathBadStatus', { httpStatus: res.status }) }
++    const body = (await res.json()) as { merklePath?: unknown; blockHeight?: unknown }
++    if (typeof body.merklePath !== 'string' || body.merklePath === '') {
++      return { name, notes: note('getMerklePathNoData') }
++    }
++    try {
++      const merklePath = MerklePath.fromHex(body.merklePath)
++      if (body.blockHeight !== undefined && body.blockHeight !== merklePath.blockHeight) {
++        throw new Error('the BUMP height does not match the block height Arcade reported')
++      }
++      // Throws unless this exact txid is a leaf of the proof.
++      merklePath.computeRoot(txid.toLowerCase())
++      const header = await getVerifiedHeader(merklePath.blockHeight)
++      if (!header) throw new Error(`height ${merklePath.blockHeight} is not in the verified header chain`)
++      return { name, merklePath, header, notes: note('getMerklePathSuccess') }
++    } catch (e) {
++      const error = e instanceof Error ? e : new Error(String(e))
++      return { name, error, notes: note('getMerklePathError', { description: error.message }) }
++    }
++  }
++}
++
++/**
++ * The `getMerklePath` override for a chain with non-mainnet rules (regtest), or
++ * undefined when the toolbox's own Arcade provider can read the chain.
++ */
++export function arcadeMerklePathOverride(
++  spv: { rules?: 'default' | 'regtest' },
++  arcUrl: string,
++  tracker: { findHeaderForHeight(height: number): Promise<Header | undefined> },
++  apiKey?: string | null
++): { merklePath: (txid: string) => Promise<MerklePathServiceResult> } | undefined {
++  if (spv.rules !== 'regtest') return undefined
++  return { merklePath: createArcadeMerklePathService(arcUrl, h => tracker.findHeaderForHeight(h), undefined, apiKey) }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/headerSetup.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/headerSetup.ts
+new file mode 100644
+index 0000000..a16081c
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/headerSetup.ts
+@@ -0,0 +1,39 @@
++/**
++ * Which trust anchor and which difficulty rules the header window uses for a
++ * chain. Defaults to the built-in checkpoint and the toolbox's rules; spv
++ * options can point the window at a different chain (a local regtest, say).
++ * Kept pure so it is testable without a wallet.
++ */
++import { regtestRules, type HeaderRules } from '../headers/chainRules'
++import { HEADER_CHECKPOINTS, type HeaderCheckpoint } from '../headers/checkpoints'
++import type { SpvOptions } from '../toolboxConfig'
++
++export interface HeaderSetup {
++  anchor: HeaderCheckpoint
++  /** undefined = the store's own default for the chain. */
++  rules: HeaderRules | undefined
++}
++
++export function resolveHeaderSetup(
++  walletChain: string,
++  spv: SpvOptions,
++  mode: 'public' | 'spv' = 'public'
++): HeaderSetup | undefined {
++  // spv trusts the wallet's own chain, so the chain's difficulty rules must be enforced. Only
++  // regtest has them today; main / test / ttn would accept any chain at the proof-of-work limit
++  // on top of the checkpoint. Refuse rather than run spv with a check that is not there.
++  if (mode === 'spv' && spv.rules !== 'regtest') {
++    throw new Error(
++      `spv mode: difficulty-adjustment rules are not implemented for ${walletChain}. ` +
++        'Only EXPO_PUBLIC_SPV_RULES=regtest is supported today.'
++    )
++  }
++  if (spv.rules === 'regtest' && !spv.anchor) {
++    throw new Error(
++      'spv regtest rules need an explicit anchor (the regtest genesis): a built-in checkpoint is not a regtest chain'
++    )
++  }
++  const anchor = spv.anchor ?? (HEADER_CHECKPOINTS as Record<string, HeaderCheckpoint | undefined>)[walletChain]
++  if (!anchor) return undefined
++  return { anchor, rules: spv.rules === 'regtest' ? regtestRules : undefined }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
+new file mode 100644
+index 0000000..84cf5e0
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
+@@ -0,0 +1,139 @@
++/**
++ * The monitor's header checks, under the chain's own difficulty rules.
++ *
++ * The toolbox monitor copies every header it handles (the chain tip TaskNewHeader polls, the
++ * header it then hands to `processNewBlockHeader`, reorg tips) through a check that requires
++ * mainnet proof of work. A header of a chain with other rules (regtest) can never pass it, so
++ * TaskNewHeader fails on every poll, `lastNewHeader` is never set and TaskCheckForProofs is
++ * never triggered: a payment received unmined stays `unproven` until the two-hour fallback.
++ *
++ * In spv mode the wallet's header chain is validated under the chain's rules (HeaderStore), so
++ * the monitor is given the same rules: the header must be well formed, its hash must be the
++ * hash of its fields, and it must satisfy `rules` for its declared bits.
++ */
++import { utils as chaintracksUtils } from '@bsv/wallet-toolbox-mobile'
++import type { HeaderRules } from '../headers/chainRules'
++
++const { validateHeaderFormat } = chaintracksUtils
++
++export interface MonitorBlockHeader {
++  version: number
++  previousHash: string
++  merkleRoot: string
++  time: number
++  bits: number
++  nonce: number
++  height: number
++  hash: string
++}
++
++/** A validated copy of `value` (only the eight header fields), or a throw naming `name`. */
++export function copyHeaderUnderRules(value: unknown, name: string, rules: HeaderRules): MonitorBlockHeader {
++  if (value === null || typeof value !== 'object') throw new Error(`The ${name} parameter must be a block header`)
++  const source = value as MonitorBlockHeader
++  const header: MonitorBlockHeader = {
++    version: source.version,
++    previousHash: source.previousHash,
++    merkleRoot: source.merkleRoot,
++    time: source.time,
++    bits: source.bits,
++    nonce: source.nonce,
++    height: source.height,
++    hash: source.hash
++  }
++  try {
++    validateHeaderFormat(header as never)
++    rules.validate({ height: header.height, hash: header.hash, bits: header.bits, time: header.time })
++  } catch (e) {
++    throw new Error(
++      `The ${name} parameter must be a canonical block header valid under ${rules.name} rules: ${(e as Error).message}`
++    )
++  }
++  return header
++}
++
++interface MonitorLike {
++  chaintracks: { findChainTipHeader: () => Promise<unknown> }
++  copyValidatedHeader?: (value: unknown, name: string) => MonitorBlockHeader
++  _tasks: { name: string }[]
++}
++
++interface AnnouncingMonitor {
++  chaintracks: { findChainTipHeader: () => Promise<unknown> }
++  lastNewHeader?: { height: number; hash?: string }
++  processNewBlockHeader: (header: unknown) => void
++}
++
++/**
++ * Hand the tip of the wallet's header chain to the monitor now, if it is one the monitor has
++ * not seen: `processNewBlockHeader` validates it (under the chain's rules once
++ * `applyChainRulesToMonitorHeaders` has run) and makes the proof task run on the next monitor
++ * cycle. The NewHeader task does the same, but one poll after it first sees a tip; this is for
++ * a caller that knows the chain has just advanced (a header sync triggered by the tip stream).
++ * Returns whether the monitor was given a new tip. Never moves the monitor to a lower tip.
++ */
++export async function announceChainTip(monitor: AnnouncingMonitor): Promise<boolean> {
++  const tip = (await monitor.chaintracks.findChainTipHeader()) as { height: number; hash: string }
++  const last = monitor.lastNewHeader
++  if (last && (last.hash === tip.hash || last.height > tip.height)) return false
++  monitor.processNewBlockHeader(tip)
++  return true
++}
++
++/**
++ * After a new tip, the proof task is asked to run again at these delays. One run is not enough
++ * for a payment received unmined shortly before its block: the wallet sends such a transaction
++ * to Arcade itself a few seconds after taking it, and the proof task passes over it until then.
++ */
++export const SPV_PROOF_RECHECK_DELAYS_MS = [4_000, 9_000]
++
++/**
++ * Make the proof task run on the next monitor cycle (what a new header does, without one).
++ * Returns false when the monitor has no proof task.
++ */
++export function requestProofCheck(monitor: { _tasks: { name: string }[] }): boolean {
++  const task = monitor._tasks.find(t => t.name === 'CheckForProofs')
++  if (!task) return false
++  ;(task.constructor as unknown as { checkNow: boolean }).checkNow = true
++  return true
++}
++
++/**
++ * How often the NewHeader task looks for a new tip in spv mode, and how long it waits after a
++ * failed look. The tip it reads is the wallet's own header chain, which otherwise advances only
++ * at start, on return to the foreground and every ten minutes, and the task itself polls once a
++ * minute and seeks proofs one poll after a new tip: a payment mined while the app stayed open
++ * was proven minutes later. In spv mode each poll first syncs the header chain (`syncHeaders`:
++ * one height request to the wallet's own Arcade when there is nothing new), so a short interval
++ * is cheap and a mined payment is proven about two polls after its block.
++ */
++export const SPV_NEW_HEADER_POLL_MS = 10_000
++export const SPV_NEW_HEADER_FAILURE_BACKOFF_MS = 30_000
++
++/**
++ * Make `monitor` (and its NewHeader task) validate headers under `rules` instead of mainnet proof
++ * of work. With `syncHeaders`, each NewHeader poll first brings the wallet's header chain up to
++ * date; a failed sync is not a failed poll (the tip read is then simply the one already held).
++ */
++export function applyChainRulesToMonitorHeaders(
++  monitor: MonitorLike,
++  rules: HeaderRules,
++  syncHeaders?: () => Promise<unknown>
++): void {
++  monitor.copyValidatedHeader = (value, name) => copyHeaderUnderRules(value, name, rules)
++  const newHeader = monitor._tasks.find(t => t.name === 'NewHeader') as
++    | { getHeader?: () => Promise<MonitorBlockHeader> }
++    | undefined
++  if (newHeader) {
++    newHeader.getHeader = async () => {
++      if (syncHeaders) {
++        try {
++          await syncHeaders()
++        } catch {
++          // Best-effort: the next poll retries.
++        }
++      }
++      return copyHeaderUnderRules(await monitor.chaintracks.findChainTipHeader(), 'chain tip header', rules)
++    }
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
+new file mode 100644
+index 0000000..7e7c85c
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
+@@ -0,0 +1,89 @@
++/**
++ * A minimal chaintracks client for the header sync: present height and raw
++ * header bytes, nothing else, and no judgement of what it returns.
++ *
++ * Why not the toolbox's `ChaintracksServiceClient`: it validates every header it
++ * reads against the MAINNET proof-of-work limit, so it cannot read any chain
++ * with other rules (a local regtest, 0x207fffff). It would also be the wrong
++ * place to decide validity: in spv mode the wallet's own `HeaderStore` applies
++ * the chain's rules to every header, so this client only transports bytes.
++ *
++ * Speaks the Arcade chaintracks v1 envelope: `{ "status": "success", "value": … }`.
++ */
++import { arcadeAuthHeaders } from './arcadeAuth'
++
++const HEADER_BYTES = 80
++const MAX_BODY_CHARS = 8 * 1024 * 1024
++const TIMEOUT_MS = 30_000
++
++export class RawChaintracksClient {
++  /** `false` tells the Monitor not to subscribe: there is no event stream here. */
++  readonly supportsReorgEvents = false
++  private readonly base: string
++  private readonly authHeaders: Record<string, string>
++
++  constructor(
++    baseUrl: string,
++    private readonly fetcher: typeof fetch = (...a) => fetch(...a),
++    apiKey?: string | null
++  ) {
++    this.base = baseUrl.replace(/\/+$/, '')
++    this.authHeaders = arcadeAuthHeaders(apiKey)
++  }
++
++  private async get(path: string): Promise<unknown> {
++    const ctl = new AbortController()
++    const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
++    try {
++      const res = await this.fetcher(`${this.base}${path}`, { signal: ctl.signal, headers: this.authHeaders })
++      if (!res.ok) throw new Error(`chaintracks ${path.split('?')[0]} answered HTTP ${res.status}`)
++      const text = await res.text()
++      if (text.length > MAX_BODY_CHARS) throw new Error('chaintracks response is too large')
++      let json: any
++      try {
++        json = JSON.parse(text)
++      } catch {
++        throw new Error(`chaintracks ${path.split('?')[0]} did not answer JSON`)
++      }
++      if (json?.status !== 'success' || !('value' in json)) {
++        throw new Error(`chaintracks ${path.split('?')[0]} did not report success`)
++      }
++      return json.value
++    } finally {
++      clearTimeout(timer)
++    }
++  }
++
++  async getPresentHeight(): Promise<number> {
++    const v = await this.get('/getPresentHeight')
++    if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0) {
++      throw new Error('chaintracks present height is not a whole number')
++    }
++    return v
++  }
++
++  /** Hex of `count` headers from `height`; may be shorter at the tip, empty past it. Not validated here. */
++  async getHeaders(height: number, count: number): Promise<string> {
++    if (!Number.isSafeInteger(height) || height < 0) throw new Error('getHeaders: height must be a whole number')
++    if (!Number.isSafeInteger(count) || count < 1) throw new Error('getHeaders: count must be a positive whole number')
++    const v = await this.get(`/getHeaders?height=${height}&count=${count}`)
++    if (typeof v !== 'string') throw new Error('chaintracks headers are not a hex string')
++    if (v === '') return ''
++    if (!/^[0-9a-fA-F]+$/.test(v) || v.length % (HEADER_BYTES * 2) !== 0) {
++      throw new Error('chaintracks headers are not whole 80-byte headers in hex')
++    }
++    if (v.length / (HEADER_BYTES * 2) > count) throw new Error('chaintracks returned more headers than requested')
++    return v
++  }
++
++  // Event streams do not exist here; OfflineFirstChaintracks turns these into inert subscriptions.
++  async subscribeHeaders(_listener?: unknown): Promise<string> {
++    throw new Error('Method not implemented.')
++  }
++  async subscribeReorgs(_listener?: unknown): Promise<string> {
++    throw new Error('Method not implemented.')
++  }
++  async unsubscribe(_id?: string): Promise<boolean> {
++    throw new Error('Method not implemented.')
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts
+new file mode 100644
+index 0000000..ddbee76
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/remoteChaintracks.ts
+@@ -0,0 +1,19 @@
++/**
++ * The remote the header sync reads from. The toolbox's own client rejects any
++ * header above the mainnet proof-of-work limit, so a chain with other rules
++ * (regtest) is read through the raw transport instead; the header store then
++ * applies that chain's rules itself.
++ */
++import { ChaintracksServiceClient, type ChaintracksClientApi } from '@bsv/wallet-toolbox-mobile'
++import type { SpvOptions } from '../toolboxConfig'
++import { RawChaintracksClient } from './rawChaintracksClient'
++
++export function makeRemoteChaintracks(
++  walletChain: 'main' | 'test' | 'ttn',
++  url: string,
++  spv: SpvOptions,
++  apiKey?: string | null
++): ChaintracksClientApi {
++  if (spv.rules === 'regtest') return new RawChaintracksClient(url, undefined, apiKey) as unknown as ChaintracksClientApi
++  return new ChaintracksServiceClient(walletChain, url)
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts
+new file mode 100644
+index 0000000..27903ee
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/serviceOrigin.ts
+@@ -0,0 +1,22 @@
++/**
++ * Which origins spv mode will send chain traffic (and an Arcade API key) to:
++ * https anywhere, plain http only to a local-development host, and never a URL
++ * that carries credentials. The same rule `toolboxConfig` applies to the backup
++ * and Mandala origins (`isAllowedServiceOrigin`); kept here as its own copy
++ * because `toolboxConfig` imports this package's spv code. A test pins the two
++ * together.
++ */
++const PRIVATE_HOST =
++  /^(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})$/
++
++export function isAllowedSpvOrigin(url: string): boolean {
++  let parsed: URL
++  try {
++    parsed = new URL(url)
++  } catch {
++    return false
++  }
++  if (parsed.username || parsed.password) return false
++  if (parsed.protocol === 'https:') return true
++  return parsed.protocol === 'http:' && PRIVATE_HOST.test(parsed.hostname)
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts
+new file mode 100644
+index 0000000..9167386
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvEventSource.ts
+@@ -0,0 +1,31 @@
++/**
++ * Arcade serves its status stream (SSE) from a separate listener from its API
++ * (spv-testnet: API :8080, SSE :8082), but the toolbox's `ArcSSEClient` builds
++ * `${arcadeUrl}/events?callbackToken=…`. This wraps the app's EventSource class so
++ * that URL, and only that URL, is moved to the SSE listener; the headers (including
++ * the API key and Last-Event-ID) pass through unchanged.
++ *
++ * With no SSE URL there is no class, so the toolbox's task reports "SSE disabled"
++ * and proofs arrive by polling alone. A URL that is not the Arcade events URL is
++ * refused, so the callback token and API key cannot be sent anywhere else.
++ */
++type EventSourceCtor = new (url: any, options?: any) => any
++
++export function makeSpvEventSourceClass(
++  Base: EventSourceCtor,
++  arcUrl: string,
++  sseUrl: string | undefined
++): EventSourceCtor | undefined {
++  if (!sseUrl) return undefined
++  const from = `${arcUrl.replace(/\/+$/, '')}/events`
++  const to = `${sseUrl.replace(/\/+$/, '')}/events`
++  return class SpvEventSource extends Base {
++    constructor(url: any, options?: any) {
++      const u = String(url)
++      if (!(u === from || u.startsWith(`${from}?`))) {
++        throw new Error('spv mode: refusing to open an event stream to a URL that is not the Arcade events URL')
++      }
++      super(`${to}${u.slice(from.length)}`, options)
++    }
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts
+new file mode 100644
+index 0000000..98093a2
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/spvMode.ts
+@@ -0,0 +1,122 @@
++/**
++ * spv chain mode: the wallet gets chain data only from the configured Arcade
++ * (broadcast, status, proofs, SSE) and Arcade's chaintracks (headers), and
++ * checks headers and proofs itself. No public indexer is consulted.
++ *
++ * FAILS CLOSED. `parseChainMode` treats anything it does not recognise as
++ * `spv`, so a typo can never silently put the wallet back on public indexers.
++ *
++ * The mode is enforced in two places that cannot come apart:
++ *  · wiring (WalletContext registers only Arcade-backed services in spv), and
++ *  · a fetch guard (`installIndexerGuard`) that rejects any request to a known
++ *    public indexer host, so a call site the wiring missed (there are many
++ *    hard-coded ones) becomes a network error instead of a leak. An error is
++ *    deliberate: a blocked lookup must never read as "not found".
++ *
++ * The guard is a deny-list of indexer hosts, not an allow-list: the app also
++ * talks to MessageBox, price and identity services that are not chain state.
++ */
++import type { AppChain } from '../config'
++import { isAllowedSpvOrigin } from './serviceOrigin'
++
++export type ChainMode = 'public' | 'spv'
++
++export function parseChainMode(raw: string | null | undefined): ChainMode {
++  const v = (raw ?? '').trim().toLowerCase()
++  if (v === '' || v === 'public') return 'public'
++  return 'spv'
++}
++
++/** Registrable-domain suffixes of public chain indexers and public ARC endpoints. */
++const BLOCKED_SUFFIXES = [
++  'whatsonchain.com',
++  'woc-ttn.bsvblockchain.tech',
++  'taal.com',
++  'gorillapool.io',
++  'gorillapool.com',
++  'bitails.io',
++  'bitails.net'
++]
++
++/** True when `url` points at a public indexer. An unparseable URL counts as blocked. */
++export function isBlockedIndexerUrl(url: string): boolean {
++  let host: string
++  try {
++    host = new URL(url).hostname.toLowerCase()
++  } catch {
++    return true
++  }
++  return BLOCKED_SUFFIXES.some(s => host === s || host.endsWith('.' + s))
++}
++
++const GUARDED = Symbol.for('bsv-browser.spv.indexerGuard')
++
++function urlOf(input: unknown): string {
++  if (typeof input === 'string') return input
++  if (input instanceof URL) return input.href
++  const maybe = input as { url?: unknown; href?: unknown } | null
++  if (maybe && typeof maybe.url === 'string') return maybe.url
++  if (maybe && typeof maybe.href === 'string') return maybe.href
++  return String(input)
++}
++
++/**
++ * Wrap `target.fetch` so requests to public indexers reject. Returns a function
++ * that restores the original. Installing again on an already-guarded fetch is a
++ * no-op, so repeated configuration cannot stack wrappers.
++ */
++export function installIndexerGuard(target: { fetch: typeof fetch }): () => void {
++  const original = target.fetch
++  if ((original as unknown as Record<symbol, unknown>)[GUARDED]) return () => {}
++  const guarded = (async (input: unknown, init?: unknown) => {
++    const url = urlOf(input)
++    if (isBlockedIndexerUrl(url)) {
++      throw new Error(`spv mode: refusing to contact a public chain indexer (${safeHost(url)})`)
++    }
++    return original(input as never, init as never)
++  }) as unknown as typeof fetch
++  ;(guarded as unknown as Record<symbol, unknown>)[GUARDED] = true
++  target.fetch = guarded
++  return () => {
++    if (target.fetch === guarded) target.fetch = original
++  }
++}
++
++function safeHost(url: string): string {
++  try {
++    return new URL(url).hostname
++  } catch {
++    return 'unparseable url'
++  }
++}
++
++const ENV_PREFIX: Record<AppChain, string> = {
++  main: 'EXPO_PUBLIC_',
++  test: 'EXPO_PUBLIC_TEST_',
++  teratest: 'EXPO_PUBLIC_TERATEST_'
++}
++
++/** spv needs an explicit Arcade and chaintracks for the chain, neither of them a public indexer. */
++export function assertSpvEndpoints(
++  chain: AppChain,
++  svc: { arcUrl?: string | null; chaintracksUrl?: string | null; sseUrl?: string | null }
++): void {
++  const p = ENV_PREFIX[chain]
++  if (!svc.arcUrl) throw new Error(`spv mode needs an Arcade URL for ${chain}: set ${p}ARC_URL`)
++  if (!svc.chaintracksUrl) throw new Error(`spv mode needs a chaintracks URL for ${chain}: set ${p}CHAINTRACKS_URL`)
++  const urls: (readonly [string, string])[] = [
++    ['Arcade', svc.arcUrl],
++    ['chaintracks', svc.chaintracksUrl]
++  ]
++  if (svc.sseUrl) urls.push(['SSE', svc.sseUrl])
++  for (const [name, url] of urls) {
++    if (isBlockedIndexerUrl(url)) {
++      throw new Error(`spv mode: the ${name} URL for ${chain} is a public indexer, not an Arcade deployment`)
++    }
++    if (!isAllowedSpvOrigin(url)) {
++      throw new Error(
++        `spv mode: the ${name} URL for ${chain} must be https (plain http is allowed only for a local-development host) and carry no credentials`
++      )
++    }
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts
+new file mode 100644
+index 0000000..041fe5a
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts
+@@ -0,0 +1,141 @@
++/**
++ * Arcade's chaintracks pushes the chain tip as a server-sent event stream
++ * (`<chaintracks>/v2/tip/stream`): the present tip on connect, then a frame for every
++ * new block. In spv mode the wallet listens to it so its header chain advances when a
++ * block is found, instead of at the next poll.
++ *
++ * A frame is a trigger and nothing else. What it carries is never read: the wallet then
++ * runs its ordinary header sync, which fetches the headers itself and validates them
++ * under the chain's rules, so the stream cannot put a header into the wallet's chain.
++ * A stream that lies or stalls costs latency only; the new-header poll still runs.
++ *
++ * The URL is derived from the configured chaintracks URL and must be an origin spv mode
++ * allows; the only credential sent is the deployment's Arcade API key, to that origin.
++ */
++import { isAllowedSpvOrigin } from './serviceOrigin'
++import { isBlockedIndexerUrl } from './spvMode'
++
++/** How long after a failed or dropped stream a new one is opened. */
++export const TIP_STREAM_RECONNECT_MS = 5_000
++/**
++ * A stream that delivers nothing for this long is closed and reopened at once. A connection that
++ * was dropped without an error looks exactly like a chain with no new block, and nothing else
++ * would ever notice it. The reopened stream sends the present tip, so the cost is one header sync
++ * that finds nothing new.
++ */
++export const TIP_STREAM_IDLE_MS = 60_000
++
++/** The tip stream of the chaintracks at `chaintracksUrl` (the stream exists only under `/v2`). */
++export function tipStreamUrl(chaintracksUrl: string): string {
++  if (isBlockedIndexerUrl(chaintracksUrl) || !isAllowedSpvOrigin(chaintracksUrl)) {
++    throw new Error('spv mode: the chaintracks URL is not an origin a tip stream may be opened to')
++  }
++  const base = chaintracksUrl.replace(/\/+$/, '').replace(/\/v[12]$/, '')
++  return `${base}/v2/tip/stream`
++}
++
++interface EventSourceLike {
++  addEventListener(type: string, cb: (event?: unknown) => void): void
++  close(): void
++}
++
++export interface TipStreamDeps {
++  EventSource: new (url: string, options?: Record<string, unknown>) => EventSourceLike
++  url: string
++  headers?: Record<string, string>
++  /** Called for every frame. Must not rely on the frame; a throw is swallowed. */
++  onTip: () => void
++  reconnectMs?: number
++  idleMs?: number
++  setTimeout?: (fn: () => void, ms: number) => unknown
++  clearTimeout?: (handle: unknown) => void
++}
++
++/** Opens the stream and keeps it open; returns the function that stops it for good. */
++export function startTipStream(deps: TipStreamDeps): () => void {
++  const schedule = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
++  const cancel = deps.clearTimeout ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>))
++  const reconnectMs = deps.reconnectMs ?? TIP_STREAM_RECONNECT_MS
++  const idleMs = deps.idleMs ?? TIP_STREAM_IDLE_MS
++  let stopped = false
++  let current: EventSourceLike | undefined
++  let retry: unknown
++  let idle: unknown
++
++  const disarm = () => {
++    if (idle !== undefined) cancel(idle)
++    idle = undefined
++  }
++
++  const reconnectLater = () => {
++    if (stopped || retry !== undefined) return
++    retry = schedule(() => {
++      retry = undefined
++      open()
++    }, reconnectMs)
++  }
++
++  const open = () => {
++    if (stopped) return
++    let source: EventSourceLike
++    try {
++      // pollingInterval 0: react-native-sse would otherwise reconnect by itself as well.
++      source = new deps.EventSource(deps.url, { headers: deps.headers ?? {}, pollingInterval: 0 })
++    } catch {
++      reconnectLater()
++      return
++    }
++    current = source
++    const live = () => !stopped && current === source
++    const close = () => {
++      current = undefined
++      disarm()
++      try {
++        source.close()
++      } catch {
++        // Already closed.
++      }
++    }
++    const arm = () => {
++      disarm()
++      idle = schedule(() => {
++        idle = undefined
++        if (!live()) return
++        close()
++        open()
++      }, idleMs)
++    }
++    arm()
++    source.addEventListener('message', () => {
++      if (!live()) return
++      arm()
++      try {
++        deps.onTip()
++      } catch {
++        // The trigger is best-effort; the next frame or the poll retries.
++      }
++    })
++    const lost = () => {
++      if (!live()) return
++      close()
++      reconnectLater()
++    }
++    source.addEventListener('error', lost)
++    source.addEventListener('close', lost)
++  }
++
++  open()
++
++  return () => {
++    stopped = true
++    if (retry !== undefined) cancel(retry)
++    retry = undefined
++    disarm()
++    try {
++      current?.close()
++    } catch {
++      // Already closed.
++    }
++    current = undefined
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts
+new file mode 100644
+index 0000000..c7707e6
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts
+@@ -0,0 +1,96 @@
++/**
++ * Zero-conf for spv mode: accept a payment whose transaction is not mined yet, but
++ * only once Arcade has SEEN it on the network.
++ *
++ * The toolbox will internalize a BEEF whose subject has no merkle proof (its
++ * ancestors must be proven) and make the output spendable at once, with no check that
++ * the network ever saw the transaction. A sender could hand over a transaction it
++ * never broadcast, or that conflicts with one already on the network. This wrapper
++ * closes that: before `internalizeAction`, every transaction in the BEEF that has no
++ * BUMP of its own must be `SEEN_ON_NETWORK` (or better) on Arcade, with no
++ * conflict. Anything else is refused, and the wallet is not called, so nothing is
++ * stored. Unlike Hodos, which keeps such an output unspendable until it is mined, a
++ * payment that is not seen yet is refused rather than parked; the sender (or a retry)
++ * presents it again once it has been broadcast.
++ *
++ * A fully proven BEEF is passed straight through without a network call. Input that
++ * cannot be read as a BEEF is left to the wallet, which rejects it itself.
++ *
++ * The toolbox then broadcasts the unmined tx itself (its request is `unsent`), which
++ * is also what registers this wallet's callback token with Arcade for push events.
++ */
++import { Beef } from '@bsv/sdk'
++import { arcadeAuthHeaders } from './arcadeAuth'
++
++const SEEN = new Set(['SEEN_ON_NETWORK', 'SEEN_ON_MULTIPLE_NODES', 'SEEN_MULTIPLE_NODES', 'MINED', 'IMMUTABLE'])
++const CONFLICT = new Set(['REJECTED', 'DOUBLE_SPEND_ATTEMPTED', 'SEEN_IN_ORPHAN_MEMPOOL'])
++
++export interface ZeroConfOptions {
++  arcUrl: string
++  apiKey?: string | null
++  fetcher?: typeof fetch
++  /** How long to wait for Arcade to have seen a tx (it usually takes well under a second). Default 4 s. */
++  waitMs?: number
++  pollMs?: number
++}
++
++type Verdict = { ok: true } | { ok: false; reason: string }
++
++async function checkSeen(txid: string, o: Required<Pick<ZeroConfOptions, 'waitMs' | 'pollMs'>> & {
++  base: string
++  headers: Record<string, string>
++  fetcher: typeof fetch
++}): Promise<Verdict> {
++  const end = Date.now() + o.waitMs
++  let last = 'unknown to Arcade'
++  for (;;) {
++    try {
++      const res = await o.fetcher(`${o.base}/tx/${txid}`, { headers: o.headers })
++      if (res.ok) {
++        const body = (await res.json()) as { txStatus?: string }
++        const st = String(body.txStatus ?? '')
++        if (CONFLICT.has(st)) return { ok: false, reason: `Arcade reports ${st}` }
++        if (SEEN.has(st)) return { ok: true }
++        last = st === '' ? 'no status' : st
++      } else {
++        last = res.status === 404 ? 'unknown to Arcade' : `Arcade answered HTTP ${res.status}`
++      }
++    } catch {
++      last = 'Arcade could not be reached'
++    }
++    if (Date.now() >= end) return { ok: false, reason: `not seen on the network (last status: ${last})` }
++    await new Promise(r => setTimeout(r, o.pollMs))
++  }
++}
++
++export function guardZeroConfInternalize<A extends { tx: number[] }, R>(
++  inner: (args: A, originator?: string) => Promise<R>,
++  options: ZeroConfOptions
++): (args: A, originator?: string) => Promise<R> {
++  const base = options.arcUrl.replace(/\/+$/, '')
++  const headers = arcadeAuthHeaders(options.apiKey)
++  const fetcher = options.fetcher ?? ((...a: Parameters<typeof fetch>) => fetch(...a))
++  const waitMs = options.waitMs ?? 4000
++  const pollMs = options.pollMs ?? 250
++
++  return async (args, originator) => {
++    let unproven: string[] = []
++    try {
++      const beef = Beef.fromBinary(args.tx)
++      unproven = beef.txs.filter(t => !t.isTxidOnly && !t.hasProof).map(t => t.txid)
++    } catch {
++      return inner(args, originator)
++    }
++    if (unproven.length === 0) return inner(args, originator)
++
++    const verdicts = await Promise.all(unproven.map(txid => checkSeen(txid, { base, headers, fetcher, waitMs, pollMs })))
++    const bad = verdicts.findIndex(v => !v.ok)
++    if (bad >= 0) {
++      const v = verdicts[bad] as { ok: false; reason: string }
++      throw new Error(
++        `zero-conf: transaction ${unproven[bad]} is not mined and ${v.reason}; not accepting an unmined payment until Arcade has seen it`
++      )
++    }
++    return inner(args, originator)
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts b/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
+index 5d8debf..20a3935 100644
+--- a/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/toolboxConfig.ts
+@@ -1,4 +1,6 @@
+ import type { AppChain } from './config'
++import { installIndexerGuard, parseChainMode, type ChainMode } from './spv/spvMode'
++import { isAllowedSpvOrigin } from './spv/serviceOrigin'
+ 
+ /**
+  * Service endpoints and API keys for one chain.
+@@ -108,6 +110,23 @@ export interface ToolboxConfig {
+    * never read from process.env here.
+    */
+   vaultEnabled?: boolean
++  /**
++   * Raw chain-mode value from the host (e.g. `process.env.EXPO_PUBLIC_CHAIN_MODE`).
++   * Unset or `public` keeps today's behaviour. Anything else is `spv` — an
++   * unrecognised value never falls back to public. See `spv/spvMode.ts`.
++   */
++  chainMode?: string | null
++  /** spv-only: header rule set and trust anchor override (a local regtest chain, for example). */
++  spv?: SpvOptions
++}
++
++export interface SpvOptions {
++  /** `regtest` = no retargeting, fixed 0x207fffff limit. Omitted = the toolbox's default rules. */
++  rules?: 'default' | 'regtest'
++  /** Trust anchor for the header window, replacing the built-in checkpoint of the chain. */
++  anchor?: { height: number; hash: string }
++  /** Arcade's SSE listener (a separate port from its API). Without it there is no push; proofs arrive by polling. */
++  sseUrl?: string
+ }
+ 
+ interface ResolvedConfig {
+@@ -116,6 +135,8 @@ interface ResolvedConfig {
+   mandala: Partial<Record<AppChain, MandalaEndpointConfig>>
+   handleRegistry: Partial<Record<AppChain, HandleRegistryConfig>>
+   vaultEnabled: boolean
++  chainMode: ChainMode
++  spv: SpvOptions
+ }
+ 
+ let current: ResolvedConfig | null = null
+@@ -193,8 +214,53 @@ export function configureToolbox(config: ToolboxConfig): void {
+     services: config.services ?? {},
+     mandala: config.mandala ?? {},
+     handleRegistry: config.handleRegistry ?? {},
+-    vaultEnabled: config.vaultEnabled === true
++    vaultEnabled: config.vaultEnabled === true,
++    chainMode: parseChainMode(config.chainMode),
++    spv: normalizeSpvOptions(config.spv)
++  }
++  // Re-running configureToolbox replaces the configuration wholesale, so the
++  // fetch guard follows the mode: installed for spv, removed for public.
++  removeIndexerGuard?.()
++  removeIndexerGuard = current.chainMode === 'spv' ? installIndexerGuard(globalThis as { fetch: typeof fetch }) : undefined
++}
++
++let removeIndexerGuard: (() => void) | undefined
++
++function normalizeSpvOptions(spv: SpvOptions | undefined): SpvOptions {
++  if (!spv) return {}
++  const out: SpvOptions = {}
++  if (spv.rules !== undefined) {
++    if (spv.rules !== 'default' && spv.rules !== 'regtest') {
++      throw new Error(`configureToolbox: spv.rules must be 'default' or 'regtest', got ${String(spv.rules)}`)
++    }
++    out.rules = spv.rules
+   }
++  if (spv.anchor !== undefined) {
++    const { height, hash } = spv.anchor
++    if (!Number.isSafeInteger(height) || height < 0 || typeof hash !== 'string' || !/^[0-9a-fA-F]{64}$/.test(hash)) {
++      throw new Error('configureToolbox: spv.anchor must be { height: non-negative integer, hash: 64 hex characters }')
++    }
++    out.anchor = { height, hash: hash.toLowerCase() }
++  }
++  if (spv.sseUrl !== undefined) {
++    if (typeof spv.sseUrl !== 'string' || !isAllowedSpvOrigin(spv.sseUrl)) {
++      throw new Error(
++        'configureToolbox: spv.sseUrl must be an https URL (plain http only for a local-development host) with no credentials'
++      )
++    }
++    out.sseUrl = spv.sseUrl
++  }
++  return out
++}
++
++/** `public` unless the host asked for spv (or gave a value we do not recognise). */
++export function getChainMode(): ChainMode {
++  return current?.chainMode ?? 'public'
++}
++
++/** spv header options; `{}` when none were given. */
++export function getSpvOptions(): SpvOptions {
++  return current?.spv ?? {}
+ }
+ 
+ /** True once `configureToolbox` has run. For hosts that want to assert their own ordering. */

@@ -208,6 +208,8 @@ Create a `.env.local` file in the project root. The app reads `EXPO_PUBLIC_*` va
 
 Testnet variants use `_TEST_` infix (e.g. `EXPO_PUBLIC_TEST_ARC_URL`). Teratest uses `_TERATEST_` infix.
 
+`EXPO_PUBLIC_CHAIN_MODE=spv` switches on an opt-in mode that uses only Arcade and a header chain the wallet verifies itself (with `EXPO_PUBLIC_SPV_RULES`, `EXPO_PUBLIC_SPV_ANCHOR_HEIGHT` / `_HASH`). It is regtest-only today. See [docs/SPV_MODE.md](docs/SPV_MODE.md).
+
 Production values are set in `eas.json` under the `production` build profile and override `.env.local`.
 
 ## Code Style

@@ -9,6 +9,7 @@ if (typeof AbortSignal !== 'undefined' && !AbortSignal.timeout) {
 
 import '../wdyr' // dev-only re-render tracking; must run before any component renders
 import '@/utils/devMenu' // dev-only profiling controls in the expo-dev-client menu
+import { spvOptionsFromEnv } from '@/utils/spvEnv'
 
 import React, { useEffect } from 'react'
 import { View, useColorScheme } from 'react-native'
@@ -54,6 +55,15 @@ import { configureToolbox } from '@bsv/expo-wallet-toolbox'
 configureToolbox({
   backupUrl: process.env.EXPO_PUBLIC_BACKUP_URL ?? null,
   vaultEnabled: false,
+  // spv chain mode: Arcade only, wallet-verified headers. Unset = public (unchanged);
+  // any other value than `public` means spv. See docs/bsv-browser-spv.md.
+  chainMode: process.env.EXPO_PUBLIC_CHAIN_MODE,
+  spv: spvOptionsFromEnv({
+    EXPO_PUBLIC_SPV_RULES: process.env.EXPO_PUBLIC_SPV_RULES,
+    EXPO_PUBLIC_SPV_ANCHOR_HEIGHT: process.env.EXPO_PUBLIC_SPV_ANCHOR_HEIGHT,
+    EXPO_PUBLIC_SPV_ANCHOR_HASH: process.env.EXPO_PUBLIC_SPV_ANCHOR_HASH,
+    EXPO_PUBLIC_SPV_SSE_URL: process.env.EXPO_PUBLIC_SPV_SSE_URL
+  }),
   services: {
     main: {
       arcUrl: process.env.EXPO_PUBLIC_ARC_URL,

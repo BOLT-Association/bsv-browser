@@ -1,6 +1,6 @@
 import { Monitor, utils } from '@bsv/wallet-toolbox-mobile'
 import { regtestRules } from '@bsv/expo-wallet-toolbox/core/headers/chainRules'
-import { applyChainRulesToMonitorHeaders, copyHeaderUnderRules } from '@bsv/expo-wallet-toolbox/core/spv/monitorHeaders'
+import { announceChainTip, applyChainRulesToMonitorHeaders, copyHeaderUnderRules, requestProofCheck } from '@bsv/expo-wallet-toolbox/core/spv/monitorHeaders'
 import { mineChain, mineHeader, type MinedHeader } from './helpers'
 
 /** A mined test header as the header object the monitor handles. */
@@ -35,6 +35,68 @@ describe('spv: the monitor validates headers under the chain rules', () => {
     expect(polled).toEqual(tip)
     m.processNewBlockHeader(polled)
     expect(m.lastNewHeader?.height).toBe(tip.height)
+  })
+
+  it('syncs the header chain before each poll reads the tip', async () => {
+    const m = monitorLike(asHeader(chain[1]))
+    // The sync is what advances the wallet's own chain: the tip read after it is the new one.
+    const sync = jest.fn(async () => { m.chaintracks.findChainTipHeader = async () => tip })
+    applyChainRulesToMonitorHeaders(m as never, regtestRules, sync)
+    expect(await m._tasks[0].getHeader!()).toEqual(tip)
+    expect(sync).toHaveBeenCalledTimes(1)
+  })
+
+  it('a failed sync is not a failed poll: the tip already held is returned', async () => {
+    const m = monitorLike(tip)
+    applyChainRulesToMonitorHeaders(m as never, regtestRules, async () => { throw new Error('offline') })
+    expect(await m._tasks[0].getHeader!()).toEqual(tip)
+  })
+
+  it('announceChainTip hands a tip the monitor has not seen to it at once, so proofs are sought without waiting for a poll', async () => {
+    const m = monitorLike(tip)
+    applyChainRulesToMonitorHeaders(m as never, regtestRules)
+    expect(await announceChainTip(m as never)).toBe(true)
+    expect(m.lastNewHeader).toEqual(tip)
+  })
+
+  it('announceChainTip does nothing when the monitor already has that tip', async () => {
+    const m = monitorLike(tip)
+    applyChainRulesToMonitorHeaders(m as never, regtestRules)
+    await announceChainTip(m as never)
+    const process = jest.spyOn(m, 'processNewBlockHeader')
+    expect(await announceChainTip(m as never)).toBe(false)
+    expect(process).not.toHaveBeenCalled()
+  })
+
+  it('announceChainTip never moves the monitor back to a lower tip', async () => {
+    const m = monitorLike(tip)
+    applyChainRulesToMonitorHeaders(m as never, regtestRules)
+    await announceChainTip(m as never)
+    m.chaintracks.findChainTipHeader = async () => asHeader(chain[1])
+    expect(await announceChainTip(m as never)).toBe(false)
+    expect(m.lastNewHeader).toEqual(tip)
+  })
+
+  it('announceChainTip still refuses a tip that is not valid under the chain rules', async () => {
+    const weak = asHeader(mineHeader({ previousHash: chain[2].hash, height: 4, work: false }))
+    const m = monitorLike(weak)
+    applyChainRulesToMonitorHeaders(m as never, regtestRules)
+    await expect(announceChainTip(m as never)).rejects.toThrow(/regtest rules/)
+    expect(m.lastNewHeader).toBeUndefined()
+  })
+
+  it('requestProofCheck makes the proof task run on the next monitor cycle, as a new header does', () => {
+    class CheckForProofs {
+      static checkNow = false
+      name = 'CheckForProofs'
+    }
+    const m = { _tasks: [{ name: 'NewHeader' }, new CheckForProofs()] }
+    expect(requestProofCheck(m as never)).toBe(true)
+    expect(CheckForProofs.checkNow).toBe(true)
+  })
+
+  it('requestProofCheck reports a monitor without the proof task instead of throwing', () => {
+    expect(requestProofCheck({ _tasks: [{ name: 'NewHeader' }] } as never)).toBe(false)
   })
 
   it('still refuses a header that does not meet its declared target', async () => {

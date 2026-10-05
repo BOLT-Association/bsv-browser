@@ -1,8 +1,8 @@
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-index 48fd575..a08c4a6 100644
+index 48fd575..c8c8292 100644
 --- a/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/context/WalletContext.tsx
-@@ -163,7 +163,15 @@ const DEFAULT_SETTINGS: WalletSettings = {
+@@ -163,7 +163,24 @@ const DEFAULT_SETTINGS: WalletSettings = {
  }
  import type { AppChain } from '../config'
  import { DEFAULT_STORAGE_URL, DEFAULT_CHAIN, ADMIN_ORIGINATOR, toWalletChain } from '../config'
@@ -10,8 +10,17 @@ index 48fd575..a08c4a6 100644
 +import { getBackupUrl, getChainMode, getMandalaEndpoints, getServiceConfig, getSpvOptions } from '../toolboxConfig'
 +import { applySpvServices } from '../spv/applySpvServices'
 +import { makeSpvEventSourceClass } from '../spv/spvEventSource'
++import { startTipStream, tipStreamUrl } from '../spv/tipStream'
++import { arcadeAuthHeaders } from '../spv/arcadeAuth'
 +import { guardZeroConfInternalize } from '../spv/zeroConf'
-+import { applyChainRulesToMonitorHeaders } from '../spv/monitorHeaders'
++import {
++  announceChainTip,
++  applyChainRulesToMonitorHeaders,
++  requestProofCheck,
++  SPV_PROOF_RECHECK_DELAYS_MS,
++  SPV_NEW_HEADER_FAILURE_BACKOFF_MS,
++  SPV_NEW_HEADER_POLL_MS
++} from '../spv/monitorHeaders'
 +import { arcadeMerklePathOverride } from '../spv/arcadeMerklePath'
 +import { resolveHeaderSetup } from '../spv/headerSetup'
 +import { makeRemoteChaintracks } from '../spv/remoteChaintracks'
@@ -19,7 +28,7 @@ index 48fd575..a08c4a6 100644
  import {
    DEFAULT_AUTO_APPROVE_THRESHOLD,
    AUTO_APPROVE_COOLDOWN_MS,
-@@ -220,7 +228,7 @@ import { logWithTimestamp } from '../logging'
+@@ -220,7 +237,7 @@ import { logWithTimestamp } from '../logging'
  import { recoverMnemonicWallet } from '../mnemonicWallet'
  import { vaultStore } from '../services/vault/vaultStore'
  import { guardVaultAccess } from '../services/vault/guard'
@@ -28,7 +37,7 @@ index 48fd575..a08c4a6 100644
  import { StorageExpoSQLite } from '../storage'
  import { makeBuildGeneration } from './buildGeneration'
  import * as SQLite from 'expo-sqlite'
-@@ -275,7 +283,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
+@@ -275,7 +292,6 @@ import { PeerPayClient } from '@bsv/message-box-client'
  import { SWEEP_INTERVAL_MS, runSweep, shouldSweepNow, sweptTotal } from '../pay/sweeper'
  import { formatAmount } from '../amountFormatHelpers'
  import { useTranslation } from 'react-i18next'
@@ -36,7 +45,7 @@ index 48fd575..a08c4a6 100644
  import { expoHeaderFs } from '../headers/fs'
  import { HeaderStore } from '../headers/headerStore'
  import { OfflineFirstChaintracks } from '../headers/OfflineFirstChaintracks'
-@@ -1257,8 +1264,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1257,8 +1273,19 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
          // for root misses and the source for header sync. chaintracksUrlFor is
          // the single source of truth for these URLs — createServiceOptions
          // calls the same function, so there is exactly one table to edit.
@@ -58,7 +67,7 @@ index 48fd575..a08c4a6 100644
          offlineChaintracksRef.current = offlineChaintracks
  
          // Passing offlineChaintracks here does two things, and createServices
-@@ -1292,7 +1310,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1292,7 +1319,7 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
          services.postBeefServices.remove('TaalArcBeef')
          services.postBeefServices.remove('Bitails')
          services.postBeefServices.remove('WhatsOnChain')
@@ -67,7 +76,7 @@ index 48fd575..a08c4a6 100644
          if (chain === 'main' || chain === 'test') {
            const taalArcUrl = chain === 'main' ? 'https://arc.taal.com' : 'https://arc-test.taal.com'
            services.postBeefServices.add(createTaalBroadcastService(taalArcUrl, serviceOptions.taalApiKey))
-@@ -1355,7 +1373,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1355,7 +1382,25 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
            getMerklePathSvc.add({ name: 'Bitails', service: bitailsGetMerklePath })
          }
  
@@ -93,7 +102,7 @@ index 48fd575..a08c4a6 100644
          // Consumed only by the toolbox storage-boundary hook. The value is set
          // by trusted host code and compared with WalletClient's originator;
          // external action fields cannot manufacture this authorization bit.
-@@ -1874,7 +1910,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -1874,7 +1919,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
            }
            const monitorOptions = createWalletMonitorOptions(walletChain, storageManager, services, offlineChaintracks)
            monitorOptions.callbackToken = callbackToken
@@ -106,7 +115,7 @@ index 48fd575..a08c4a6 100644
            monitorOptions.onTransactionStatusChanged = async (_txid: string, _newStatus: string) => {
              setTxStatusVersion(v => v + 1)
              // The database moved, so the backup log has something to catch up on.
-@@ -2143,6 +2183,14 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+@@ -2143,9 +2192,30 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
              }
            }
  
@@ -115,13 +124,29 @@ index 48fd575..a08c4a6 100644
 +          // would never be sought. Validate under the rules of the wallet's verified chain instead.
 +          if (spvMode) {
 +            const spvRules = resolveHeaderSetup(walletChain, getSpvOptions(), 'spv')?.rules
-+            if (spvRules) applyChainRulesToMonitorHeaders(monitor as never, spvRules)
++            // Each new-header poll also syncs the header chain, so proofs do not wait for the app
++            // to return to the foreground (see SPV_NEW_HEADER_POLL_MS).
++            if (spvRules) {
++              applyChainRulesToMonitorHeaders(monitor as never, spvRules, async () => {
++                const store = headerStoreRef.current
++                if (!store || offlineChaintracksRef.current !== offlineChaintracks) return
++                if (!(await getOnline())) return
++                const r = await runHeaderSync(store, remoteChaintracks)
++                if (r?.added) logWithTimestamp(F, `Header sync (new-header poll): +${r.added} to ${r.tipHeight}`)
++              })
++            }
 +          }
 +
            const newHeaderTask = monitor._tasks.find((t: any) => t.name === 'NewHeader') as any
            if (newHeaderTask) {
              configureNewHeaderPolling(newHeaderTask, {
-@@ -2316,11 +2364,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
++              ...(spvMode
++                ? { pollIntervalMs: SPV_NEW_HEADER_POLL_MS, failureBackoffMs: SPV_NEW_HEADER_FAILURE_BACKOFF_MS }
++                : {}),
+               onFailure: (error, retryAt) => {
+                 const message = error instanceof Error ? error.message : String(error)
+                 console.warn(
+@@ -2316,11 +2386,11 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
              // a store) that belongs to a different build.
              const stillCurrent = () => offlineChaintracksRef.current === offlineChaintracks
              try {
@@ -136,6 +161,60 @@ index 48fd575..a08c4a6 100644
                logWithTimestamp(F, `HeaderStore.open took ${Date.now() - openStart}ms (${store.count} headers)`)
                if (!stillCurrent()) return
                headerStoreRef.current = store
+@@ -2953,6 +3023,53 @@ export const WalletContextProvider: React.FC<WalletContextProps> = ({ children =
+     })
+   }, [walletBuilt, selectedNetwork, runHeaderSync])
+ 
++  // spv: Arcade's chaintracks pushes each new chain tip (spv/tipStream.ts). A frame is only a
++  // trigger: it runs the same header sync as the triggers above, and the monitor is then told
++  // of the new tip at once, so proofs for the new block are sought on its next cycle instead of
++  // a poll or two later. The new-header poll stays as the fallback for a stream that is down.
++  useEffect(() => {
++    if (!walletBuilt || getChainMode() !== 'spv') return
++    let stop: (() => void) | undefined
++    let cancelled = false
++    const rechecks: ReturnType<typeof setTimeout>[] = []
++    const onTip = async () => {
++      const ct = offlineChaintracksRef.current
++      const store = headerStoreRef.current
++      if (!ct || !store) return
++      if (store.chain !== toWalletChain(selectedNetwork)) return
++      const r = await runHeaderSync(store, ct)
++      if (r?.added) logWithTimestamp(F, `Header sync (tip stream): +${r.added} to ${r.tipHeight}`)
++      const monitor = monitorRef.current
++      if (!monitor) return
++      if (await announceChainTip(monitor as never)) {
++        for (const ms of SPV_PROOF_RECHECK_DELAYS_MS) {
++          rechecks.push(setTimeout(() => {
++            if (monitorRef.current === monitor) requestProofCheck(monitor as never)
++          }, ms))
++        }
++      }
++    }
++    ;(async () => {
++      try {
++        const key = (await getArcApiToken(selectedNetwork)) || getServiceConfig(selectedNetwork).arcApiKey || undefined
++        if (cancelled) return
++        stop = startTipStream({
++          EventSource: loadQuietEventSourceClass() as never,
++          url: tipStreamUrl(chaintracksUrlFor(selectedNetwork)),
++          headers: arcadeAuthHeaders(key),
++          onTip: () => void onTip().catch(() => {})
++        })
++      } catch (e: any) {
++        console.warn('[WalletContext] tip stream unavailable:', e?.message)
++      }
++    })()
++    return () => {
++      cancelled = true
++      stop?.()
++      rechecks.forEach(clearTimeout)
++    }
++  }, [walletBuilt, selectedNetwork, runHeaderSync])
++
+   // Feed the drain's and the backup push's online gates, arming an immediate pass on
+   // reconnect. Both are gated on the app's single online signal.
+   useEffect(() => {
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts b/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts
 index da96849..52f7788 100644
 --- a/node_modules/@bsv/expo-wallet-toolbox/core/headers/OfflineFirstChaintracks.ts
@@ -1054,10 +1133,10 @@ index 0000000..a16081c
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
 new file mode 100644
-index 0000000..3bd7c58
+index 0000000..84cf5e0
 --- /dev/null
 +++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/monitorHeaders.ts
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,139 @@
 +/**
 + * The monitor's header checks, under the chain's own difficulty rules.
 + *
@@ -1118,15 +1197,83 @@ index 0000000..3bd7c58
 +  _tasks: { name: string }[]
 +}
 +
-+/** Make `monitor` (and its NewHeader task) validate headers under `rules` instead of mainnet proof of work. */
-+export function applyChainRulesToMonitorHeaders(monitor: MonitorLike, rules: HeaderRules): void {
++interface AnnouncingMonitor {
++  chaintracks: { findChainTipHeader: () => Promise<unknown> }
++  lastNewHeader?: { height: number; hash?: string }
++  processNewBlockHeader: (header: unknown) => void
++}
++
++/**
++ * Hand the tip of the wallet's header chain to the monitor now, if it is one the monitor has
++ * not seen: `processNewBlockHeader` validates it (under the chain's rules once
++ * `applyChainRulesToMonitorHeaders` has run) and makes the proof task run on the next monitor
++ * cycle. The NewHeader task does the same, but one poll after it first sees a tip; this is for
++ * a caller that knows the chain has just advanced (a header sync triggered by the tip stream).
++ * Returns whether the monitor was given a new tip. Never moves the monitor to a lower tip.
++ */
++export async function announceChainTip(monitor: AnnouncingMonitor): Promise<boolean> {
++  const tip = (await monitor.chaintracks.findChainTipHeader()) as { height: number; hash: string }
++  const last = monitor.lastNewHeader
++  if (last && (last.hash === tip.hash || last.height > tip.height)) return false
++  monitor.processNewBlockHeader(tip)
++  return true
++}
++
++/**
++ * After a new tip, the proof task is asked to run again at these delays. One run is not enough
++ * for a payment received unmined shortly before its block: the wallet sends such a transaction
++ * to Arcade itself a few seconds after taking it, and the proof task passes over it until then.
++ */
++export const SPV_PROOF_RECHECK_DELAYS_MS = [4_000, 9_000]
++
++/**
++ * Make the proof task run on the next monitor cycle (what a new header does, without one).
++ * Returns false when the monitor has no proof task.
++ */
++export function requestProofCheck(monitor: { _tasks: { name: string }[] }): boolean {
++  const task = monitor._tasks.find(t => t.name === 'CheckForProofs')
++  if (!task) return false
++  ;(task.constructor as unknown as { checkNow: boolean }).checkNow = true
++  return true
++}
++
++/**
++ * How often the NewHeader task looks for a new tip in spv mode, and how long it waits after a
++ * failed look. The tip it reads is the wallet's own header chain, which otherwise advances only
++ * at start, on return to the foreground and every ten minutes, and the task itself polls once a
++ * minute and seeks proofs one poll after a new tip: a payment mined while the app stayed open
++ * was proven minutes later. In spv mode each poll first syncs the header chain (`syncHeaders`:
++ * one height request to the wallet's own Arcade when there is nothing new), so a short interval
++ * is cheap and a mined payment is proven about two polls after its block.
++ */
++export const SPV_NEW_HEADER_POLL_MS = 10_000
++export const SPV_NEW_HEADER_FAILURE_BACKOFF_MS = 30_000
++
++/**
++ * Make `monitor` (and its NewHeader task) validate headers under `rules` instead of mainnet proof
++ * of work. With `syncHeaders`, each NewHeader poll first brings the wallet's header chain up to
++ * date; a failed sync is not a failed poll (the tip read is then simply the one already held).
++ */
++export function applyChainRulesToMonitorHeaders(
++  monitor: MonitorLike,
++  rules: HeaderRules,
++  syncHeaders?: () => Promise<unknown>
++): void {
 +  monitor.copyValidatedHeader = (value, name) => copyHeaderUnderRules(value, name, rules)
 +  const newHeader = monitor._tasks.find(t => t.name === 'NewHeader') as
 +    | { getHeader?: () => Promise<MonitorBlockHeader> }
 +    | undefined
 +  if (newHeader) {
-+    newHeader.getHeader = async () =>
-+      copyHeaderUnderRules(await monitor.chaintracks.findChainTipHeader(), 'chain tip header', rules)
++    newHeader.getHeader = async () => {
++      if (syncHeaders) {
++        try {
++          await syncHeaders()
++        } catch {
++          // Best-effort: the next poll retries.
++        }
++      }
++      return copyHeaderUnderRules(await monitor.chaintracks.findChainTipHeader(), 'chain tip header', rules)
++    }
 +  }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/rawChaintracksClient.ts
@@ -1440,6 +1587,153 @@ index 0000000..98093a2
 +        `spv mode: the ${name} URL for ${chain} must be https (plain http is allowed only for a local-development host) and carry no credentials`
 +      )
 +    }
++  }
++}
+diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts
+new file mode 100644
+index 0000000..041fe5a
+--- /dev/null
++++ b/node_modules/@bsv/expo-wallet-toolbox/core/spv/tipStream.ts
+@@ -0,0 +1,141 @@
++/**
++ * Arcade's chaintracks pushes the chain tip as a server-sent event stream
++ * (`<chaintracks>/v2/tip/stream`): the present tip on connect, then a frame for every
++ * new block. In spv mode the wallet listens to it so its header chain advances when a
++ * block is found, instead of at the next poll.
++ *
++ * A frame is a trigger and nothing else. What it carries is never read: the wallet then
++ * runs its ordinary header sync, which fetches the headers itself and validates them
++ * under the chain's rules, so the stream cannot put a header into the wallet's chain.
++ * A stream that lies or stalls costs latency only; the new-header poll still runs.
++ *
++ * The URL is derived from the configured chaintracks URL and must be an origin spv mode
++ * allows; the only credential sent is the deployment's Arcade API key, to that origin.
++ */
++import { isAllowedSpvOrigin } from './serviceOrigin'
++import { isBlockedIndexerUrl } from './spvMode'
++
++/** How long after a failed or dropped stream a new one is opened. */
++export const TIP_STREAM_RECONNECT_MS = 5_000
++/**
++ * A stream that delivers nothing for this long is closed and reopened at once. A connection that
++ * was dropped without an error looks exactly like a chain with no new block, and nothing else
++ * would ever notice it. The reopened stream sends the present tip, so the cost is one header sync
++ * that finds nothing new.
++ */
++export const TIP_STREAM_IDLE_MS = 60_000
++
++/** The tip stream of the chaintracks at `chaintracksUrl` (the stream exists only under `/v2`). */
++export function tipStreamUrl(chaintracksUrl: string): string {
++  if (isBlockedIndexerUrl(chaintracksUrl) || !isAllowedSpvOrigin(chaintracksUrl)) {
++    throw new Error('spv mode: the chaintracks URL is not an origin a tip stream may be opened to')
++  }
++  const base = chaintracksUrl.replace(/\/+$/, '').replace(/\/v[12]$/, '')
++  return `${base}/v2/tip/stream`
++}
++
++interface EventSourceLike {
++  addEventListener(type: string, cb: (event?: unknown) => void): void
++  close(): void
++}
++
++export interface TipStreamDeps {
++  EventSource: new (url: string, options?: Record<string, unknown>) => EventSourceLike
++  url: string
++  headers?: Record<string, string>
++  /** Called for every frame. Must not rely on the frame; a throw is swallowed. */
++  onTip: () => void
++  reconnectMs?: number
++  idleMs?: number
++  setTimeout?: (fn: () => void, ms: number) => unknown
++  clearTimeout?: (handle: unknown) => void
++}
++
++/** Opens the stream and keeps it open; returns the function that stops it for good. */
++export function startTipStream(deps: TipStreamDeps): () => void {
++  const schedule = deps.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
++  const cancel = deps.clearTimeout ?? (handle => clearTimeout(handle as ReturnType<typeof setTimeout>))
++  const reconnectMs = deps.reconnectMs ?? TIP_STREAM_RECONNECT_MS
++  const idleMs = deps.idleMs ?? TIP_STREAM_IDLE_MS
++  let stopped = false
++  let current: EventSourceLike | undefined
++  let retry: unknown
++  let idle: unknown
++
++  const disarm = () => {
++    if (idle !== undefined) cancel(idle)
++    idle = undefined
++  }
++
++  const reconnectLater = () => {
++    if (stopped || retry !== undefined) return
++    retry = schedule(() => {
++      retry = undefined
++      open()
++    }, reconnectMs)
++  }
++
++  const open = () => {
++    if (stopped) return
++    let source: EventSourceLike
++    try {
++      // pollingInterval 0: react-native-sse would otherwise reconnect by itself as well.
++      source = new deps.EventSource(deps.url, { headers: deps.headers ?? {}, pollingInterval: 0 })
++    } catch {
++      reconnectLater()
++      return
++    }
++    current = source
++    const live = () => !stopped && current === source
++    const close = () => {
++      current = undefined
++      disarm()
++      try {
++        source.close()
++      } catch {
++        // Already closed.
++      }
++    }
++    const arm = () => {
++      disarm()
++      idle = schedule(() => {
++        idle = undefined
++        if (!live()) return
++        close()
++        open()
++      }, idleMs)
++    }
++    arm()
++    source.addEventListener('message', () => {
++      if (!live()) return
++      arm()
++      try {
++        deps.onTip()
++      } catch {
++        // The trigger is best-effort; the next frame or the poll retries.
++      }
++    })
++    const lost = () => {
++      if (!live()) return
++      close()
++      reconnectLater()
++    }
++    source.addEventListener('error', lost)
++    source.addEventListener('close', lost)
++  }
++
++  open()
++
++  return () => {
++    stopped = true
++    if (retry !== undefined) cancel(retry)
++    retry = undefined
++    disarm()
++    try {
++      current?.close()
++    } catch {
++      // Already closed.
++    }
++    current = undefined
 +  }
 +}
 diff --git a/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts b/node_modules/@bsv/expo-wallet-toolbox/core/spv/zeroConf.ts

@@ -26,7 +26,7 @@ import { observer } from 'mobx-react-lite'
 import { router } from 'expo-router'
 
 import { useTheme } from '@bsv/expo-wallet-toolbox/core/theme/ThemeContext'
-import { useWalletManagers } from '@bsv/expo-wallet-toolbox/core/context/WalletContext'
+import { useWalletManagers, useWalletStatus } from '@bsv/expo-wallet-toolbox/core/context/WalletContext'
 import { guardVaultAccess } from '@bsv/expo-wallet-toolbox/core/services/vault/guard'
 import { capWalletArgs } from '@bsv/expo-wallet-toolbox/core/services/capWalletArgs'
 import {
@@ -68,6 +68,7 @@ import {
 import { buildWalletErrorEnvelope, buildWalletSuccessEnvelope } from '@/utils/webview/walletEnvelope'
 import { normalizeWalletByteFields } from '@/utils/webview/walletByteJson'
 import { getPaymentHandler } from '@/utils/webview/bsvPaymentHandler'
+import { BOLT_MESSAGE, serveBolt } from '@/utils/bolt/boltService'
 import {
   getErrorPage,
   getNativeErrorInfo,
@@ -746,6 +747,7 @@ const Browser = observer(function Browser() {
 
   /* ----------------------------- wallet context ----------------------------- */
   const { managers, walletBuilding } = useWalletManagers()
+  const { selectedNetwork } = useWalletStatus()
   const [wallet, setWallet] = useState<WalletInterface | undefined>()
   // Fed into the document-start script so pages get getVersion answered in the
   // page (see utils/webview/documentStartScript.ts). Undefined until the wallet
@@ -1346,6 +1348,19 @@ const Browser = observer(function Browser() {
 
       if (await routeWebViewMessage(msg)) return
 
+      // window.BOLT (utils/bolt): the token interface beside window.CWI. The reply is a BOLT
+      // envelope, delivered to the page the same way a wallet response is.
+      if (msg.type === BOLT_MESSAGE) {
+        if (typeof msg.id !== 'string' || !activeTab?.webviewRef?.current) return
+        const pm = managers?.permissionsManager
+        const reply =
+          !pm || isWeb2Mode || !frameIdentity
+            ? { type: BOLT_MESSAGE, id: msg.id, isReply: true, error: 'BOLT: the wallet is not available to this page' }
+            : await serveBolt(pm as any, selectedNetwork, frameIdentity.originator, msg)
+        activeTab.webviewRef.current?.injectJavaScript(buildWalletResponseScript(reply, frameIdentity?.responseOrigin))
+        return
+      }
+
       if (msg.call && (!wallet || isWeb2Mode)) {
         if (isWeb2Mode) {
           // Web2 mode: wallet calls are not supported, send error immediately
@@ -1463,7 +1478,7 @@ const Browser = observer(function Browser() {
         perfEnd()
       }
     },
-    [activeTab, wallet, routeWebViewMessage, isWeb2Mode, walletBuilding]
+    [activeTab, wallet, routeWebViewMessage, isWeb2Mode, walletBuilding, managers, selectedNetwork]
   )
 
   /**

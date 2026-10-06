@@ -1,4 +1,5 @@
 import { buildCWIProviderScript } from './cwiProvider'
+import { webViewProviderScript as buildBOLTProviderScript } from '@/vendor/bolt/bolt'
 
 /**
  * Only a short, visible-ASCII version string may be embedded into the
@@ -9,6 +10,8 @@ const WALLET_VERSION_PATTERN = /^[\x21-\x7e]{7,30}$/
 
 /**
  * Builds the document-start script installed in every WebView frame.
+ *
+ * The BOLT provider (window.BOLT, utils/bolt) is installed beside it, in the top document only.
  *
  * The BRC-100 provider must exist in child frames so embedded apps can talk
  * directly to the native wallet bridge. Browser polyfills and permission hooks
@@ -72,6 +75,7 @@ export function buildWalletDocumentStartScript(mainFrameScript: string, walletVe
   try { window.ReactNativeWebView = wrapped; } catch (_) {}
 })();
 ${buildCWIProviderScript()}
+${buildBOLTProviderScript()}
 (function() {
   if (window.top !== window) return;
 ${mainFrameScript}
